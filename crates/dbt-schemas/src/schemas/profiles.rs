@@ -62,7 +62,7 @@ pub enum DbConfig {
     // Rockset,
     // Firebolt,
     // Teradata,
-    // Athena,
+    Athena(Box<AthenaDbConfig>),
     // Vertica,
     // TiDB,
     // #[serde(rename = "glue")]
@@ -107,6 +107,7 @@ impl_from_db_config!(DuckDB, DuckDbConfig);
 impl_from_db_config!(Fabric, FabricDbConfig);
 impl_from_db_config!(Exasol, ExasolDbConfig);
 impl_from_db_config!(ClickHouse, ClickHouseDbConfig);
+impl_from_db_config!(Athena, AthenaDbConfig);
 
 impl DbConfig {
     pub fn get_unique_field(&self) -> Option<&str> {
@@ -126,6 +127,8 @@ impl DbConfig {
             DbConfig::Fabric(config) => config.host.as_deref(),
             DbConfig::Exasol(config) => config.host.as_deref(),
             DbConfig::ClickHouse(config) => config.host.as_deref(),
+            // Mirrors dbt-athena's `unique_field` (md5 of s3_staging_dir).
+            DbConfig::Athena(config) => config.s3_staging_dir.as_deref(),
         }
     }
 
@@ -269,10 +272,8 @@ impl DbConfig {
                 "fivetran_auth_url",
             ],
             // Adapter types with no `DbConfig` variant, so nothing to display.
-            AdapterType::Athena
-            | AdapterType::Starburst
-            | AdapterType::Dremio
-            | AdapterType::Oracle => &[],
+            // Athena has moved to its own arm below, with a real key list.
+            AdapterType::Starburst | AdapterType::Dremio | AdapterType::Oracle => &[],
             // TODO(serramatutu): Spark connection keys
             AdapterType::Spark => &[],
             // TODO: Trino and Datafusion connection keys
@@ -306,6 +307,35 @@ impl DbConfig {
                 "connection_timeout",
                 "query_timeout",
                 "idle_timeout",
+            ],
+            AdapterType::Athena => &[
+                // dbt-athena's own _connection_keys lists aws_access_key_id;
+                // it is omitted here because `dbt debug` prints these to
+                // stdout and into any log that captures it. Secrets
+                // (aws_secret_access_key, aws_session_token) are omitted for
+                // the same reason.
+                "region_name",
+                "database",
+                "schema",
+                "s3_staging_dir",
+                "s3_data_dir",
+                "s3_data_naming",
+                "s3_tmp_table_dir",
+                "work_group",
+                "spark_work_group",
+                "skip_workgroup_check",
+                "endpoint_url",
+                "aws_profile_name",
+                "assume_role_arn",
+                "assume_role_external_id",
+                "assume_role_session_name",
+                "assume_role_duration_seconds",
+                "poll_interval",
+                "debug_query_state",
+                "num_retries",
+                "num_boto3_retries",
+                "num_iceberg_retries",
+                "threads",
             ],
             AdapterType::ClickHouse => &[
                 "database",
@@ -370,6 +400,7 @@ impl DbConfig {
             DbConfig::LakeCompute(config) => dbt_yaml::to_value(config),
             DbConfig::Exasol(config) => dbt_yaml::to_value(config),
             DbConfig::ClickHouse(config) => dbt_yaml::to_value(config),
+            DbConfig::Athena(config) => dbt_yaml::to_value(config),
         }
     }
 
@@ -388,6 +419,7 @@ impl DbConfig {
             DbConfig::Fabric(..) => AdapterType::Fabric,
             DbConfig::Exasol(..) => AdapterType::Exasol,
             DbConfig::ClickHouse(..) => AdapterType::ClickHouse,
+            DbConfig::Athena(..) => AdapterType::Athena,
             DbConfig::LakeCompute(..) => AdapterType::LakeCompute,
         }
     }
@@ -407,6 +439,7 @@ impl DbConfig {
             DbConfig::Fabric(config) => config.database.as_ref(),
             DbConfig::Exasol(config) => config.database.as_ref(),
             DbConfig::ClickHouse(config) => config.database.as_ref(),
+            DbConfig::Athena(config) => config.database.as_ref(),
             DbConfig::LakeCompute(config) => config.database.as_ref(),
         }
     }
@@ -448,6 +481,7 @@ impl DbConfig {
             DbConfig::Fabric(config) => config.schema.as_ref(),
             DbConfig::Exasol(config) => config.schema.as_ref(),
             DbConfig::ClickHouse(config) => config.schema.as_ref(),
+            DbConfig::Athena(config) => config.schema.as_ref(),
         }
     }
 
@@ -466,6 +500,7 @@ impl DbConfig {
             DbConfig::Fabric(_) => None,
             DbConfig::Exasol(config) => config.threads.as_ref(),
             DbConfig::ClickHouse(config) => config.threads.as_ref(),
+            DbConfig::Athena(config) => config.threads.as_ref(),
             DbConfig::LakeCompute(config) => config.threads.as_ref(),
         }
     }
@@ -485,6 +520,7 @@ impl DbConfig {
             DbConfig::Fabric(_) => (),
             DbConfig::Exasol(config) => config.threads = threads,
             DbConfig::ClickHouse(config) => config.threads = threads,
+            DbConfig::Athena(config) => config.threads = threads,
             DbConfig::LakeCompute(config) => config.threads = threads,
         }
     }
@@ -1355,6 +1391,114 @@ pub struct ExasolDbConfig {
     pub threads: Option<StringOrInteger>,
 }
 
+/// Amazon Athena.
+///
+/// Fields mirror `AthenaCredentials` in dbt-athena 1.11.0
+/// (`dbt/adapters/athena/connections_legacy.py`) so that an existing
+/// dbt 1.x `profiles.yml` parses unchanged. `catalog` is accepted as an
+/// alias for `database`, matching the adapter's `_ALIASES`.
+///
+/// Note on defaults: the Python adapter defaults `s3_data_naming` to
+/// "schema_table_unique" and `num_retries` to 5. Those are left as `None`
+/// here rather than baked in, so that an unset field round-trips as unset
+/// and the default stays owned by whatever eventually executes queries,
+/// not by the profile schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, DbtSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
+#[serde(rename_all = "snake_case")]
+pub struct AthenaDbConfig {
+    /// AWS region, e.g. "us-east-2". Required by the adapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_name: Option<String>,
+
+    /// Glue catalog. `catalog` is the dbt-athena alias for this field.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "catalog")]
+    pub database: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+
+    /// S3 prefix for Athena query results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_staging_dir: Option<String>,
+
+    /// S3 prefix for table data, when not colocated with staging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_data_dir: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_data_naming: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_tmp_table_dir: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_group: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spark_work_group: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_workgroup_check: Option<bool>,
+
+    /// Custom Athena endpoint, for VPC endpoints or testing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_profile_name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_access_key_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_secret_access_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_session_token: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assume_role_arn: Option<String>,
+
+    /// Not a secret: a shared condition value guarding against confused-deputy
+    /// attacks. See the AWS external-id documentation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assume_role_external_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assume_role_session_name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assume_role_duration_seconds: Option<StringOrInteger>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<StringOrInteger>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_query_state: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_retries: Option<StringOrInteger>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_boto3_retries: Option<StringOrInteger>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_iceberg_retries: Option<StringOrInteger>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lf_tags_database: Option<HashMap<String, String>>,
+
+    /// Passed through to the S3 upload for seeds. Free-form in the Python
+    /// adapter (`Dict[str, Any]`), so it is kept opaque here rather than
+    /// modelled — nothing in the profile schema needs to interpret it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_s3_upload_args: Option<YmlValue>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<StringOrInteger>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, DbtSchema, Merge)]
 #[merge(strategy = merge_strategies_extend::overwrite_option)]
 #[serde(rename_all = "snake_case")]
@@ -1585,6 +1729,7 @@ pub enum TargetContext {
     Fabric(FabricTargetEnv),
     Exasol(ExasolTargetEnv),
     ClickHouse(ClickHouseTargetEnv),
+    Athena(AthenaTargetEnv),
     // Add other variants as needed
 }
 
@@ -1766,6 +1911,19 @@ pub struct FabricTargetEnv {
 pub struct ExasolTargetEnv {
     pub host: Option<String>,
     pub user: Option<String>,
+    pub __common__: CommonTargetContext,
+}
+
+/// The `target` context exposed to Jinja for Athena.
+///
+/// Deliberately narrow: only non-secret connection facts a model might
+/// legitimately branch on. Credentials are never surfaced here.
+#[derive(Serialize, DbtSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct AthenaTargetEnv {
+    pub region_name: Option<String>,
+    pub s3_staging_dir: Option<String>,
+    pub work_group: Option<String>,
     pub __common__: CommonTargetContext,
 }
 
@@ -2195,6 +2353,21 @@ impl TryFrom<DbConfig> for TargetContext {
                 },
             })),
 
+            DbConfig::Athena(config) => Ok(TargetContext::Athena(AthenaTargetEnv {
+                region_name: config.region_name.clone(),
+                s3_staging_dir: config.s3_staging_dir.clone(),
+                work_group: config.work_group.clone(),
+                __common__: CommonTargetContext {
+                    // dbt-athena defaults the catalog to awsdatacatalog.
+                    database: config
+                        .database
+                        .clone()
+                        .unwrap_or_else(|| "awsdatacatalog".to_string()),
+                    schema: config.schema.clone().ok_or_else(|| missing("schema"))?,
+                    type_: adapter_type,
+                    threads: None,
+                },
+            })),
             DbConfig::ClickHouse(config) => Ok(TargetContext::ClickHouse(ClickHouseTargetEnv {
                 driver: config.driver.clone(),
                 host: config.host.clone(),
@@ -2377,6 +2550,139 @@ query_tags:
         } else {
             panic!("Expected DbConfig::Bigquery, got {config:?}",);
         }
+    }
+
+    /// A real dbt 1.x Athena target must parse unchanged. These fields are the
+    /// exact shape of a production profile: staging and data prefixes, region,
+    /// the awsdatacatalog catalog, and a workgroup.
+    #[test]
+    fn test_athena_profile_parses_a_real_target() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: athena\n\
+             threads: 12\n\
+             num_retries: 3\n\
+             s3_staging_dir: s3://staging/results/\n\
+             s3_data_dir: s3://data/\n\
+             region_name: us-east-2\n\
+             database: awsdatacatalog\n\
+             schema: analytics\n\
+             s3_data_naming: schema_table_unique\n\
+             work_group: dbt",
+        )
+        .unwrap();
+        let DbConfig::Athena(athena) = &config else {
+            panic!("Expected DbConfig::Athena, got {config:?}");
+        };
+        assert_eq!(athena.region_name.as_deref(), Some("us-east-2"));
+        assert_eq!(athena.database.as_deref(), Some("awsdatacatalog"));
+        assert_eq!(athena.schema.as_deref(), Some("analytics"));
+        assert_eq!(athena.work_group.as_deref(), Some("dbt"));
+        assert_eq!(
+            athena.s3_staging_dir.as_deref(),
+            Some("s3://staging/results/")
+        );
+        assert_eq!(config.adapter_type(), AdapterType::Athena);
+    }
+
+    /// Real Athena profiles in the wild carry keys that are NOT in dbt-athena's
+    /// `AthenaCredentials` — `table_type` is the common one, set at target level
+    /// even though the adapter only reads it as a model config. The Python
+    /// adapter tolerates it, so parsing must too: rejecting it would break every
+    /// such project on the first `dbt debug`.
+    #[test]
+    fn test_athena_profile_tolerates_keys_outside_the_credential_set() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: athena\n\
+             region_name: us-east-2\n\
+             s3_staging_dir: s3://staging/x/\n\
+             database: awsdatacatalog\n\
+             schema: analytics_qa\n\
+             table_type: iceberg",
+        )
+        .expect("a profile carrying `table_type` must still parse");
+        let DbConfig::Athena(athena) = &config else {
+            panic!("Expected DbConfig::Athena");
+        };
+        assert_eq!(athena.schema.as_deref(), Some("analytics_qa"));
+    }
+
+    /// dbt-athena declares `_ALIASES = {"catalog": "database"}`, so a profile
+    /// written against the alias must land on the same field.
+    #[test]
+    fn test_athena_catalog_is_an_alias_for_database() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: athena\n\
+             region_name: us-east-2\n\
+             catalog: awsdatacatalog\n\
+             schema: s",
+        )
+        .unwrap();
+        let DbConfig::Athena(athena) = &config else {
+            panic!("Expected DbConfig::Athena");
+        };
+        assert_eq!(athena.database.as_deref(), Some("awsdatacatalog"));
+    }
+
+    /// dbt-athena's `unique_field` hashes s3_staging_dir; the telemetry id is
+    /// derived from whatever this returns, so it must not silently become None.
+    #[test]
+    fn test_athena_unique_field_is_the_staging_dir() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: athena\n\
+             region_name: us-east-2\n\
+             s3_staging_dir: s3://staging/x/\n\
+             schema: s",
+        )
+        .unwrap();
+        assert_eq!(config.get_unique_field(), Some("s3://staging/x/"));
+        assert!(config.get_adapter_unique_id().is_some());
+    }
+
+    /// Guards the decision to diverge from dbt-athena's own `_connection_keys`,
+    /// which lists aws_access_key_id. `dbt debug` prints these to stdout, so no
+    /// AWS identity or secret may appear — a stricter bar than the generic
+    /// credential audit enforces, since `aws_access_key_id` matches none of its
+    /// substring markers.
+    #[test]
+    fn test_athena_connection_keys_omit_every_aws_credential() {
+        let keys = DbConfig::connection_keys_for(AdapterType::Athena);
+        assert!(!keys.is_empty(), "Athena must not fall back to an empty list");
+        for forbidden in [
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+        ] {
+            assert!(
+                !keys.contains(&forbidden),
+                "`{forbidden}` must not be printed by `dbt debug`"
+            );
+        }
+        // The useful, non-secret ones are present.
+        for expected in ["region_name", "s3_staging_dir", "work_group", "schema"] {
+            assert!(keys.contains(&expected), "expected `{expected}` in the keys");
+        }
+    }
+
+    /// The catalog defaults to awsdatacatalog, matching dbt-athena, so a profile
+    /// that omits `database` still produces a usable target context.
+    #[test]
+    fn test_athena_target_context_defaults_the_catalog() {
+        let config: DbConfig = dbt_yaml::from_str(
+            "type: athena\n\
+             region_name: us-east-2\n\
+             s3_staging_dir: s3://staging/x/\n\
+             work_group: dbt\n\
+             schema: analytics_qa",
+        )
+        .unwrap();
+        let target = TargetContext::try_from(config).unwrap();
+        let TargetContext::Athena(target) = target else {
+            panic!("Expected TargetContext::Athena");
+        };
+        assert_eq!(target.__common__.database, "awsdatacatalog");
+        assert_eq!(target.__common__.schema, "analytics_qa");
+        assert_eq!(target.region_name.as_deref(), Some("us-east-2"));
+        assert_eq!(target.work_group.as_deref(), Some("dbt"));
     }
 
     #[test]
