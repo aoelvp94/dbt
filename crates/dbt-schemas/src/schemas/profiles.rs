@@ -1,7 +1,9 @@
 #![allow(unused_qualifications)]
 
 use crate::schemas::relations::DEFAULT_DATABRICKS_DATABASE;
-use crate::schemas::serde::{DuckDbExtension, QueryTag, StringOrInteger, StringOrMap};
+use crate::schemas::serde::{
+    DuckDbExtension, FloatOrString, QueryTag, StringOrInteger, StringOrMap,
+};
 
 use dbt_adapter_core::AdapterType;
 use dbt_yaml::DbtSchema;
@@ -1471,8 +1473,9 @@ pub struct AthenaDbConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assume_role_duration_seconds: Option<StringOrInteger>,
 
+    /// Seconds between Athena query-status polls; a float upstream (default 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub poll_interval: Option<StringOrInteger>,
+    pub poll_interval: Option<FloatOrString>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_query_state: Option<bool>,
