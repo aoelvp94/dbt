@@ -1455,7 +1455,9 @@ impl PartialEq for SpannedStringOrArrayOfStrings {
 
 impl Eq for SpannedStringOrArrayOfStrings {}
 
-#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, DbtSchema)]
+// `PartialEq` but not `Eq`: the `f32` payload is not `Eq`. Needed so config
+// structs that derive `PartialEq` (every `*DbConfig`) can hold this type.
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, PartialEq, DbtSchema)]
 #[serde(untagged)]
 pub enum FloatOrString {
     Number(f32),
