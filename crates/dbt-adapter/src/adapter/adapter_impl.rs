@@ -19,6 +19,7 @@ use crate::metadata::bigquery::{
     BIGQUERY_PSEUDOCOLUMNS, BigqueryMetadataAdapter, is_bigquery_not_found_error,
     nest_column_data_types,
 };
+use crate::metadata::athena::AthenaMetadataAdapter;
 use crate::metadata::clickhouse::ClickHouseMetadataAdapter;
 use crate::metadata::databricks::DatabricksMetadataAdapter;
 use crate::metadata::databricks::dbr_capabilities;
@@ -316,11 +317,9 @@ impl AdapterImpl {
                             Box::new(ExasolMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
                         }
                         Starburst => todo!("Starburst"),
-                        // Execution layer: needs an AthenaMetadataAdapter
-                        // implementing MetadataAdapter against a live
-                        // connection. Out of scope for parse-only profile
-                        // work; parse never constructs a metadata adapter.
-                        Athena => todo!("Athena"),
+                        Athena => {
+                            Box::new(AthenaMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
+                        }
                         Trino => todo!("Trino"),
                         Datafusion => todo!("Datafusion"),
                         Dremio => todo!("Dremio"),
@@ -4116,9 +4115,12 @@ impl AdapterImpl {
             Impl(Fabric, engine) => {
                 fabric::list_relations(engine.as_ref(), query_ctx, conn, db_schema, token)
             }
+            Impl(Athena, engine) => {
+                athena::list_relations(engine.as_ref(), query_ctx, conn, db_schema, token)
+            }
             Impl(
-                adapter_type @ (Postgres | Salesforce | ClickHouse | Exasol | Starburst | Athena
-                | Trino | Datafusion | Dremio | Oracle),
+                adapter_type @ (Postgres | Salesforce | ClickHouse | Exasol | Starburst | Trino
+                | Datafusion | Dremio | Oracle),
                 _,
             ) => {
                 let err = AdapterError::new(
