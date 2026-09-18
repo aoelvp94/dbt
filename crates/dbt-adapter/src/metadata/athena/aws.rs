@@ -37,8 +37,15 @@ where
     }
 }
 
-fn aws_error(op: &str, e: impl std::fmt::Display) -> AdapterError {
-    AdapterError::new(AdapterErrorKind::Driver, format!("[athena/aws] {op} failed: {e}"))
+fn aws_error_msg(op: &str, detail: impl std::fmt::Display) -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Driver, format!("[athena/aws] {op} failed: {detail}"))
+}
+
+fn aws_error(op: &str, e: impl std::error::Error) -> AdapterError {
+    // `SdkError`'s Display is a one-word category ("dispatch failure"); the
+    // context walker prints the cause chain (expired SSO token, DNS, TLS...).
+    let detail = aws_smithy_types::error::display::DisplayErrorContext(&e).to_string();
+    AdapterError::new(AdapterErrorKind::Driver, format!("[athena/aws] {op} failed: {detail}"))
 }
 
 /// Build (once) the S3 and Glue clients from the adapter's profile config.
@@ -153,7 +160,7 @@ pub fn delete_prefix(clients: &Arc<AthenaAwsClients>, bucket: &str, prefix: &str
                     .map_err(|e| aws_error(&format!("DeleteObjects s3://{bucket}/{prefix}"), e))?;
                 if !out.errors().is_empty() {
                     let first = &out.errors()[0];
-                    return Err(aws_error(
+                    return Err(aws_error_msg(
                         "DeleteObjects",
                         format!(
                             "{} object(s) failed, first: key={:?} code={:?} message={:?}",
@@ -242,7 +249,7 @@ pub fn expire_table_versions(
                 .await
                 .map_err(|e| aws_error(&format!("BatchDeleteTableVersion {database_c}.{table_c}"), e))?;
             if !out.errors().is_empty() {
-                return Err(aws_error(
+                return Err(aws_error_msg(
                     "BatchDeleteTableVersion",
                     format!("{} version(s) failed to delete", out.errors().len()),
                 ));
@@ -280,4 +287,90 @@ mod tests {
         assert_eq!(parse_s3_path("s3://bucket").unwrap(), ("bucket".to_string(), String::new()));
         assert!(parse_s3_path("gs://x/y").is_err());
     }
+}
+
+/// One `information_schema`-shaped catalog row (one per column), as dbt's
+/// `get_catalog_relations` contract expects.
+#[derive(Debug, Clone)]
+pub struct GlueCatalogRow {
+    pub table_schema: String,
+    pub table_name: String,
+    pub table_type: String,
+    pub table_comment: Option<String>,
+    pub table_owner: Option<String>,
+    pub column_name: String,
+    pub column_index: i64,
+    pub column_type: String,
+    pub column_comment: Option<String>,
+}
+
+/// dbt-athena `get_catalog_by_relations`: list a Glue database's tables
+/// (optionally only `tables`, compared lowercase) and flatten them into one
+/// row per column, regular columns first and partition keys after, the way
+/// Athena's `information_schema.columns` orders them. Unlike a schema-wide
+/// `information_schema` query this never touches table data, so a table with
+/// unreadable Iceberg metadata cannot fail the whole schema.
+pub fn glue_catalog_rows(
+    clients: &Arc<AthenaAwsClients>,
+    database: &str,
+    tables: Option<&[String]>,
+) -> AdapterResult<Vec<GlueCatalogRow>> {
+    let glue = clients.glue.clone();
+    let database = database.to_string();
+    let wanted: Option<std::collections::HashSet<String>> =
+        tables.map(|ts| ts.iter().map(|t| t.to_lowercase()).collect());
+    block_on(async move {
+        let mut rows = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = glue.get_tables().database_name(&database).max_results(100);
+            if let Some(t) = &token {
+                req = req.next_token(t);
+            }
+            let page = match req.send().await {
+                Ok(p) => p,
+                // A schema that does not exist yields no catalog rows, not an error
+                // (dbt hydrates the catalog for target schemas not yet created).
+                Err(e) if e.to_string().contains("EntityNotFoundException") => break,
+                Err(e) => return Err(aws_error(&format!("GetTables {database}"), e)),
+            };
+            for t in page.table_list() {
+                let name = t.name().to_string();
+                if let Some(w) = &wanted
+                    && !w.contains(&name.to_lowercase())
+                {
+                    continue;
+                }
+                let table_type = match t.table_type() {
+                    Some("VIRTUAL_VIEW") => "VIEW",
+                    _ => "BASE TABLE",
+                }
+                .to_string();
+                let regular = t
+                    .storage_descriptor()
+                    .map(|sd| sd.columns().to_vec())
+                    .unwrap_or_default();
+                let mut index = 0i64;
+                for c in regular.iter().chain(t.partition_keys().iter()) {
+                    index += 1;
+                    rows.push(GlueCatalogRow {
+                        table_schema: database.clone(),
+                        table_name: name.clone(),
+                        table_type: table_type.clone(),
+                        table_comment: t.description().map(str::to_string),
+                        table_owner: t.owner().map(str::to_string),
+                        column_name: c.name().to_string(),
+                        column_index: index,
+                        column_type: c.r#type().unwrap_or("").to_string(),
+                        column_comment: c.comment().map(str::to_string),
+                    });
+                }
+            }
+            token = page.next_token().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(rows)
+    })
 }

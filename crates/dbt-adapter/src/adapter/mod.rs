@@ -393,6 +393,98 @@ impl Adapter {
         Ok(location)
     }
 
+    /// dbt-athena `get_catalog(information_schema, schemas)` and
+    /// `get_catalog_by_relations(information_schema, relations)`: the docs
+    /// catalog straight from Glue `GetTables`, returned as the agate table
+    /// `get_catalog_relations` callers expect (one row per column, Postgres
+    /// column names). `relations` may hold relation objects or `{'schema': ..}`
+    /// maps; a relation without an identifier means the whole schema.
+    pub fn athena_get_catalog(&self, name: &str, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena(name)?;
+        let second = if name == "get_catalog" { "schemas" } else { "relations" };
+        let arg_names = ["information_schema", second];
+        let iter = ArgsIter::new(name, &arg_names, args);
+        let information_schema = iter.next_arg::<&Value>()?;
+        let items = iter.next_arg::<&Value>()?;
+        iter.finish()?;
+
+        let database = information_schema
+            .get_attr("database")
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.engine().get_config().get_str("database").map(str::to_string))
+            .unwrap_or_else(|| "awsdatacatalog".to_string());
+
+        // schema -> Some(tables) | None (whole schema)
+        let mut wanted: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+        for item in items.try_iter()? {
+            let (schema, identifier) = if name == "get_catalog" {
+                (item.as_str().map(str::to_string), None)
+            } else if let Ok(rel) = downcast_value_to_dyn_base_relation(&item) {
+                (
+                    rel.schema_as_resolved_str().ok(),
+                    rel.identifier_as_resolved_str().ok().filter(|s| !s.is_empty()),
+                )
+            } else {
+                (
+                    item.get_attr("schema").ok().and_then(|v| v.as_str().map(str::to_string)),
+                    item.get_attr("identifier").ok().and_then(|v| v.as_str().map(str::to_string)),
+                )
+            };
+            let Some(schema) = schema.filter(|s| !s.is_empty()) else { continue };
+            let entry = wanted.entry(schema.to_lowercase()).or_insert_with(|| Some(Vec::new()));
+            match (identifier, entry.as_mut()) {
+                (Some(id), Some(list)) => list.push(id),
+                (None, _) => *entry = None,
+                (Some(_), None) => {}
+            }
+        }
+
+        let clients = aws::clients(self.engine().get_config())?;
+        let mut rows = Vec::new();
+        for (schema, tables) in &wanted {
+            rows.extend(aws::glue_catalog_rows(&clients, schema, tables.as_deref())?);
+        }
+
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let strs = |f: &dyn Fn(&aws::GlueCatalogRow) -> Option<String>| -> ArrayRef {
+            Arc::new(StringArray::from(rows.iter().map(f).collect::<Vec<Option<String>>>()))
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![database.as_str(); rows.len()])),
+            strs(&|r| Some(r.table_schema.clone())),
+            strs(&|r| Some(r.table_name.clone())),
+            strs(&|r| Some(r.table_type.clone())),
+            strs(&|r| r.table_comment.clone()),
+            strs(&|r| Some(r.column_name.clone())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.column_index).collect::<Vec<i64>>())),
+            strs(&|r| Some(r.column_type.clone())),
+            strs(&|r| r.column_comment.clone()),
+            strs(&|r| r.table_owner.clone()),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_database", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("table_type", DataType::Utf8, false),
+            Field::new("table_comment", DataType::Utf8, true),
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("column_index", DataType::Int64, false),
+            Field::new("column_type", DataType::Utf8, false),
+            Field::new("column_comment", DataType::Utf8, true),
+            Field::new("table_owner", DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, columns).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("{name}: failed to build catalog batch: {e}"),
+            )
+        })?;
+        Ok(Value::from_object(AgateTable::from_record_batch(Arc::new(batch))))
+    }
+
     /// dbt-athena `is_work_group_output_location_enforced`. Answering
     /// truthfully needs the Athena GetWorkGroup API, which Fusion cannot call
     /// yet; `false` is what dbt-athena returns with `skip_workgroup_check`,
@@ -5092,6 +5184,8 @@ impl Adapter {
             }
             // dbt-athena Python-side helpers that need no AWS API.
             "generate_s3_location" => self.athena_generate_s3_location(state, args),
+            // dbt-athena builds the docs catalog from Glue, not information_schema.
+            "get_catalog" | "get_catalog_by_relations" => self.athena_get_catalog(name, args),
             "is_work_group_output_location_enforced" => {
                 self.athena_is_work_group_output_location_enforced(args)
             }
