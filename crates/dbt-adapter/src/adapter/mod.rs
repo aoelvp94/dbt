@@ -540,8 +540,13 @@ impl Adapter {
             return Ok(Some("view"));
         }
 
+        // Comment-free on purpose: for Hive tables Athena runs SHOW CREATE
+        // TABLE through its Hive DDL engine, which rejects a leading
+        // `/* ... */` query comment with a ParseException (Iceberg tables go
+        // through Trino and accept it). The query comment is only added when
+        // the engine is handed a Jinja state, so pass none.
         let sql = format!("show create table `{schema}`.`{identifier}`");
-        let (_, table) = self.execute(state, None, &sql, false, true, None, None)?;
+        let (_, table) = self.athena_execute_uncommented(state, &sql)?;
         let batch = table.original_record_batch();
         let lines: Vec<String> = batch
             .columns()
@@ -634,6 +639,33 @@ impl Adapter {
             }
         };
         Ok(pair(literal, "="))
+    }
+
+    /// Execute `sql` on the thread-local connection without the query
+    /// comment prefix (see `athena_table_type`).
+    fn athena_execute_uncommented(
+        &self,
+        state: &State,
+        sql: &str,
+    ) -> Result<(AdapterResponse, AgateTable), minijinja::Error> {
+        match &self.inner {
+            Typed { adapter, .. } => {
+                let mut conn =
+                    adapter.borrow_tlocal_connection(Some(state), node_id_from_state(state))?;
+                Ok(adapter.execute(
+                    None,
+                    conn.as_mut(),
+                    None,
+                    sql,
+                    false,
+                    true,
+                    None,
+                    None,
+                    self.cancellation_token.clone(),
+                )?)
+            }
+            Parse(_) => Ok((AdapterResponse::default(), AgateTable::default())),
+        }
     }
 
     fn ensure_athena(&self, name: &str) -> Result<(), minijinja::Error> {
