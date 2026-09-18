@@ -640,10 +640,13 @@ impl Adapter {
         Ok(self.athena_table_info(state, relation)?.map(|info| info.kind))
     }
 
-    /// Table kind plus, for tables, the S3 location from the DDL.
+    /// Table kind plus, for tables, the S3 location, read from the Glue
+    /// catalog (dbt-athena's `get_glue_table`). One `GetTable` call replaces
+    /// the `information_schema` probe and `SHOW CREATE TABLE` this used to
+    /// run: each of those was a full Athena query taking seconds.
     fn athena_table_info(
         &self,
-        state: &State,
+        _state: &State,
         relation: &dyn BaseRelation,
     ) -> Result<Option<AthenaTableInfo>, minijinja::Error> {
         if relation.relation_type() == Some(RelationType::View) {
@@ -651,95 +654,53 @@ impl Adapter {
         }
         let schema = relation.schema_as_resolved_str()?;
         let identifier = relation.identifier_as_resolved_str()?;
+        let clients = aws::clients(self.engine().get_config())?;
+        Ok(aws::glue_get_table(&clients, &schema, &identifier)?
+            .map(|t| AthenaTableInfo { kind: t.kind, location: t.location }))
+    }
 
-        // Existence first: `SHOW CREATE TABLE` on a missing table does not say
-        // "not found" -- Athena falls back to its Hive parser, which rejects the
-        // leading query comment with a ParseException. The macros call
-        // `drop_relation` on relation objects that may not exist yet.
-        let exists_sql = format!(
-            "select table_type from information_schema.tables \
-             where lower(table_schema) = '{}' and lower(table_name) = '{}' limit 1",
-            crate::metadata::athena::athena_string_literal(&schema),
-            crate::metadata::athena::athena_string_literal(&identifier)
-        );
-        let (_, exists) = self.execute(state, None, &exists_sql, false, true, None, None)?;
-        let exists_batch = exists.original_record_batch();
-        if exists_batch.num_rows() == 0 {
-            return Ok(None);
-        }
-        let is_view = exists_batch
-            .columns()
-            .first()
-            .and_then(|col| arrow::util::display::array_value_to_string(col, 0).ok())
-            .is_some_and(|t| t.trim().eq_ignore_ascii_case("VIEW"));
-        if is_view {
-            return Ok(Some(AthenaTableInfo { kind: "view", location: None }));
-        }
-
-        // Comment-free on purpose: for Hive tables Athena runs SHOW CREATE
-        // TABLE through its Hive DDL engine, which rejects a leading
-        // `/* ... */` query comment with a ParseException (Iceberg tables go
-        // through Trino and accept it). The query comment is only added when
-        // the engine is handed a Jinja state, so pass none.
-        let sql = format!("show create table `{schema}`.`{identifier}`");
-        let (_, table) = self.athena_execute_uncommented(state, &sql)?;
-        let batch = table.original_record_batch();
-        let lines: Vec<String> = batch
-            .columns()
-            .first()
-            .map(|col| {
-                (0..batch.num_rows())
-                    .filter_map(|i| arrow::util::display::array_value_to_string(col, i).ok())
-                    .map(|line| line.trim().to_ascii_uppercase())
-                    .filter(|line| !line.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if lines.is_empty() {
-            return Ok(None);
-        }
-        // `LOCATION 's3://...'` -- the DDL is uppercased above, so re-read the
-        // original row for the path's case.
-        // Iceberg DDL: `LOCATION 's3://...'` on one line. Hive DDL: `LOCATION`
-        // on one line and the quoted path on the next.
-        let raw_lines: Vec<String> = (0..batch.num_rows())
-            .filter_map(|i| {
-                batch
-                    .columns()
-                    .first()
-                    .and_then(|col| arrow::util::display::array_value_to_string(col, i).ok())
-            })
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect();
-        let quoted = |line: &str| -> Option<String> {
-            let start = line.find('\'')? + 1;
-            let end = line[start..].find('\'')? + start;
-            Some(line[start..end].to_string())
-        };
-        let location = raw_lines
-            .iter()
-            .position(|line| line.to_ascii_uppercase().starts_with("LOCATION"))
-            .and_then(|i| {
-                quoted(&raw_lines[i]).or_else(|| raw_lines.get(i + 1).and_then(|l| quoted(l)))
-            });
-        let any = |pred: &dyn Fn(&str) -> bool| lines.iter().any(|l| pred(l));
-        let kind = if any(&|l| l.starts_with("CREATE VIEW")) {
-            "view"
-        } else if any(&|l| l.contains("'TABLE_TYPE'='ICEBERG'")) {
-            "iceberg_table"
-        } else if any(&|l| {
-            l.starts_with("CREATE EXTERNAL TABLE")
-                || l.starts_with("ROW FORMAT")
-                || l.starts_with("STORED AS")
-                || l.starts_with("INPUTFORMAT")
-        }) {
-            "table"
-        } else {
-            // Iceberg DDL without the property line (older engine output).
-            "iceberg_table"
-        };
-        Ok(Some(AthenaTableInfo { kind, location }))
+    /// dbt-athena reads a relation's columns from Glue (`get_columns_in_relation`
+    /// override). Returns the `information_schema.columns`-shaped table the
+    /// vendored `athena__get_columns_in_relation` macro hands to
+    /// `sql_convert_columns_in_relation`; empty when the table does not exist.
+    pub fn athena_get_glue_table_columns(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("get_glue_table_columns")?;
+        let iter = ArgsIter::new("get_glue_table_columns", &["relation"], args);
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        iter.finish()?;
+        let clients = aws::clients(self.engine().get_config())?;
+        let columns = aws::glue_get_table(
+            &clients,
+            &relation.schema_as_resolved_str()?,
+            &relation.identifier_as_resolved_str()?,
+        )?
+        .map(|t| t.columns)
+        .unwrap_or_default();
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; columns.len()]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(columns.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>())),
+            nulls.clone(),
+            nulls.clone(),
+            nulls,
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("character_maximum_length", DataType::Int64, true),
+            Field::new("numeric_precision", DataType::Int64, true),
+            Field::new("numeric_scale", DataType::Int64, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("get_glue_table_columns: failed to build batch: {e}"),
+            )
+        })?;
+        Ok(Value::from_object(AgateTable::from_record_batch(Arc::new(batch))))
     }
 
     /// dbt-athena `delete_from_s3`: delete every object under an S3 prefix.
@@ -5193,6 +5154,7 @@ impl Adapter {
                 self.athena_run_query_with_partitions_limit_catching(state, args)
             }
             "get_glue_table_type" => self.athena_get_glue_table_type(state, args),
+            "get_glue_table_columns" => self.athena_get_glue_table_columns(args),
             "format_partition_keys" => self.athena_format_partition_keys(args),
             "format_one_partition_key" => self.athena_format_one_partition_key(args),
             "format_value_for_partition" => self.athena_format_value_for_partition(args),

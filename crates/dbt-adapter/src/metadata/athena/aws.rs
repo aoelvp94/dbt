@@ -292,6 +292,99 @@ mod tests {
 /// One `information_schema`-shaped catalog row (one per column), as dbt's
 /// `get_catalog_relations` contract expects.
 #[derive(Debug, Clone)]
+/// One Glue table as the relation lookups need it. `kind` follows
+/// dbt-athena's `TableType` values: `table`, `view` or `iceberg_table`.
+pub struct GlueTableInfo {
+    pub name: String,
+    pub kind: &'static str,
+    pub location: Option<String>,
+    /// Regular columns followed by partition keys, as `(name, glue type)`.
+    pub columns: Vec<(String, String)>,
+}
+
+fn glue_table_info(t: &aws_sdk_glue::types::Table) -> GlueTableInfo {
+    let kind = if t.table_type() == Some("VIRTUAL_VIEW") {
+        "view"
+    } else if t
+        .parameters()
+        .and_then(|p| p.get("table_type"))
+        .is_some_and(|v| v.eq_ignore_ascii_case("ICEBERG"))
+    {
+        "iceberg_table"
+    } else {
+        "table"
+    };
+    let regular = t
+        .storage_descriptor()
+        .map(|sd| sd.columns().to_vec())
+        .unwrap_or_default();
+    let columns = regular
+        .iter()
+        .chain(t.partition_keys().iter())
+        .map(|c| (c.name().to_string(), c.r#type().unwrap_or("").to_string()))
+        .collect();
+    GlueTableInfo {
+        name: t.name().to_string(),
+        kind,
+        location: t
+            .storage_descriptor()
+            .and_then(|sd| sd.location())
+            .map(str::to_string),
+        columns,
+    }
+}
+
+/// Glue `GetTable`: `None` when the table (or its database) does not exist.
+/// Names are lowercased first, as Athena folds identifiers and Glue stores
+/// them that way.
+pub fn glue_get_table(
+    clients: &Arc<AthenaAwsClients>,
+    database: &str,
+    name: &str,
+) -> AdapterResult<Option<GlueTableInfo>> {
+    let glue = clients.glue.clone();
+    let (database, name) = (database.to_lowercase(), name.to_lowercase());
+    block_on(async move {
+        match glue.get_table().database_name(&database).name(&name).send().await {
+            Ok(out) => Ok(out.table().map(glue_table_info)),
+            Err(e) if e.to_string().contains("EntityNotFoundException") => Ok(None),
+            Err(e) => Err(aws_error(&format!("GetTable {database}.{name}"), e)),
+        }
+    })
+}
+
+/// Glue `GetTables` for one database, paginated. A missing database yields
+/// an empty list, which is what relation-cache hydration wants for schemas
+/// that are not created yet.
+pub fn glue_list_tables(
+    clients: &Arc<AthenaAwsClients>,
+    database: &str,
+) -> AdapterResult<Vec<GlueTableInfo>> {
+    let glue = clients.glue.clone();
+    let database = database.to_lowercase();
+    block_on(async move {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = glue.get_tables().database_name(&database).max_results(100);
+            if let Some(t) = &token {
+                req = req.next_token(t);
+            }
+            let page = match req.send().await {
+                Ok(p) => p,
+                Err(e) if e.to_string().contains("EntityNotFoundException") => break,
+                Err(e) => return Err(aws_error(&format!("GetTables {database}"), e)),
+            };
+            out.extend(page.table_list().iter().map(glue_table_info));
+            token = page.next_token().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    })
+}
+
 pub struct GlueCatalogRow {
     pub table_schema: String,
     pub table_name: String,

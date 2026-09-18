@@ -327,59 +327,36 @@ impl MetadataAdapter for AthenaMetadataAdapter {
     }
 }
 
-/// List every table and view in a schema by querying `information_schema.tables`.
-///
-/// A schema that does not exist yields zero rows rather than an error, which
-/// is what cache hydration wants for not-yet-created target schemas. The
-/// catalog filter is skipped when dbt has no resolved database (Athena's
-/// `information_schema` is scoped to the connection's catalog anyway).
 pub fn list_relations(
     engine: &dyn AdapterEngine,
-    ctx: &QueryCtx,
-    conn: &'_ mut dyn Connection,
+    _ctx: &QueryCtx,
+    _conn: &'_ mut dyn Connection,
     db_schema: &CatalogAndSchema,
-    token: CancellationToken,
+    _token: CancellationToken,
 ) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
-    let schema_literal = athena_string_literal(&db_schema.resolved_schema);
-    let catalog_filter = if db_schema.resolved_catalog.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " and lower(table_catalog) = '{}'",
-            athena_string_literal(&db_schema.resolved_catalog)
-        )
-    };
-    let sql = format!(
-        "select table_schema, table_name, table_type \
-         from information_schema.tables \
-         where lower(table_schema) = '{schema_literal}'{catalog_filter}"
-    );
-
-    let batch = engine.execute(None, conn, ctx, &sql, token)?;
-
-    if batch.num_rows() == 0 {
-        return Ok(Vec::new());
-    }
-
-    let table_schemas = batch.column_values::<StringArray>("table_schema")?;
-    let table_names = batch.column_values::<StringArray>("table_name")?;
-    let table_types = batch.column_values::<StringArray>("table_type")?;
-
-    let mut relations = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        let relation = Relation::new(
-            engine.adapter_type(),
-            Some(db_schema.resolved_catalog.clone()),
-            Some(table_schemas.value(i).to_string()),
-            Some(table_names.value(i).to_string()),
-        )
-        .with_relation_type(relation_type_from_table_type(table_types.value(i)))
-        .with_quoting(engine.quoting());
-
-        relations.push(Arc::new(relation) as Arc<dyn BaseRelation>);
-    }
-
-    Ok(relations)
+    // Glue GetTables (paginated) rather than an Athena information_schema
+    // query: milliseconds instead of seconds, and a missing schema is an
+    // empty list rather than an error. Matches dbt-athena.
+    let clients = aws::clients(engine.get_config())?;
+    let tables = aws::glue_list_tables(&clients, &db_schema.resolved_schema)?;
+    Ok(tables
+        .into_iter()
+        .map(|t| {
+            let relation = Relation::new(
+                engine.adapter_type(),
+                Some(db_schema.resolved_catalog.clone()),
+                Some(db_schema.resolved_schema.clone()),
+                Some(t.name),
+            )
+            .with_relation_type(if t.kind == "view" {
+                RelationType::View
+            } else {
+                RelationType::Table
+            })
+            .with_quoting(engine.quoting());
+            Arc::new(relation) as Arc<dyn BaseRelation>
+        })
+        .collect())
 }
 
 #[cfg(test)]
