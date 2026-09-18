@@ -211,6 +211,28 @@ impl Object for RelationObject {
                 self.get(&key, default)
             }
             "render" => Ok(render_without_filter(self)),
+            // dbt-athena `AthenaRelation.render_hive()`: Athena's Hive-style
+            // DDL (CREATE/DROP/ALTER TABLE, CREATE SCHEMA) takes `schema`.`table`
+            // with backticks and no catalog.
+            "render_hive" if self.adapter_type() == AdapterType::Athena => {
+                let parts: Vec<String> = [self.schema(), self.identifier()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("`{s}`"))
+                    .collect();
+                Ok(Value::from(parts.join(".")))
+            }
+            // dbt-athena `AthenaRelation.render_pure()`: the full name with no
+            // quoting at all, used by OPTIMIZE / VACUUM / ALTER ... ADD COLUMNS.
+            "render_pure" if self.adapter_type() == AdapterType::Athena => {
+                let parts: Vec<&str> = [self.database(), self.schema(), self.identifier()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                Ok(Value::from(parts.join(".")))
+            }
             "derivative" => {
                 let iter = ArgsIter::new("derivative", &["suffix", "relation_type"], args);
                 let suffix = iter.next_arg::<&str>()?;
@@ -411,6 +433,13 @@ impl Object for RelationObject {
             Some("mvs_pointing_to_it") => Some(Value::from_serialize(self.mvs_pointing_to_it())),
             Some("is_refreshable") => Some(Value::from(self.is_refreshable())),
             Some("refreshable_append") => Some(Value::from(self.refreshable_append())),
+
+            // Athena (dbt-athena `AthenaRelation.s3_path_table_part`)
+            Some("s3_path_table_part") => Some(
+                crate::relation::relation_impl::athena_s3_path_table_part(self.relation.as_ref())
+                    .map(Value::from)
+                    .unwrap_or_else(none_value),
+            ),
 
             _ => None,
         }

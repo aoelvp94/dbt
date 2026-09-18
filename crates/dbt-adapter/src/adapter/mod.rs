@@ -43,6 +43,7 @@ use minijinja::dispatch_object::DispatchObject;
 use minijinja::listener::RenderingEventListener;
 use minijinja::value::mutable_vec::MutableVec;
 use minijinja::value::{Object, ValueKind};
+use dbt_schemas::dbt_types::RelationType;
 use minijinja::{State, Value};
 use serde::Deserialize;
 use tracing;
@@ -267,6 +268,297 @@ impl Adapter {
                  catalog entries through the Glue / S3 APIs, which Fusion cannot call yet"
             ),
         ))
+    }
+
+    /// dbt-athena `generate_s3_location`: the S3 prefix a table is created
+    /// under. `external_location` wins for non-temporary tables; otherwise the
+    /// root is `s3_tmp_table_dir` (temporary tables only), else `s3_data_dir`,
+    /// else `<s3_staging_dir>/tables`, and `s3_data_naming` decides how
+    /// schema / table / a UUID are appended.
+    pub fn athena_generate_s3_location(
+        &self,
+        state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("generate_s3_location")?;
+        let iter = ArgsIter::new(
+            "generate_s3_location",
+            &[
+                "relation",
+                "s3_data_dir",
+                "s3_data_naming",
+                "s3_tmp_table_dir",
+                "external_location",
+                "is_temporary_table",
+            ],
+            args,
+        );
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        let s3_data_dir = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let s3_data_naming = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let s3_tmp_table_dir = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let external_location = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let is_temporary_table = iter.next_arg::<Option<bool>>()?.unwrap_or(false);
+        iter.finish()?;
+
+        if let Some(external) = external_location
+            && !is_temporary_table
+        {
+            return Ok(Value::from(external.trim_end_matches('/').to_string()));
+        }
+
+        let target = state.lookup("target", &[]).ok_or_else(|| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                "generate_s3_location: target is not set in state",
+            )
+        })?;
+        let target_str = |key: &str| -> Option<String> {
+            target
+                .get_attr(key)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+        };
+
+        let s3_tmp_table_dir = s3_tmp_table_dir.or_else(|| target_str("s3_tmp_table_dir"));
+        let table_prefix = match (s3_tmp_table_dir, is_temporary_table) {
+            (Some(tmp), true) => tmp,
+            _ => match s3_data_dir.or_else(|| target_str("s3_data_dir")) {
+                Some(dir) => dir,
+                None => {
+                    let staging = target_str("s3_staging_dir").ok_or_else(|| {
+                        minijinja::Error::new(
+                            minijinja::ErrorKind::InvalidOperation,
+                            "generate_s3_location: neither s3_data_dir nor s3_staging_dir is set",
+                        )
+                    })?;
+                    format!("{}/tables", staging.trim_end_matches('/'))
+                }
+            },
+        };
+        let table_prefix = table_prefix.trim_end_matches('/').to_string();
+
+        let identifier = relation.identifier_as_resolved_str()?;
+        let table_part = crate::relation::athena_s3_path_table_part(relation.as_ref())
+            .unwrap_or(identifier);
+        let schema = relation.schema_as_resolved_str()?;
+        // dbt-athena defaults `s3_data_naming` to schema_table_unique.
+        let naming = s3_data_naming
+            .or_else(|| target_str("s3_data_naming"))
+            .unwrap_or_else(|| "schema_table_unique".to_string());
+        let unique = || uuid::Uuid::new_v4().to_string();
+
+        let location = match naming.as_str() {
+            "unique" => format!("{table_prefix}/{}", unique()),
+            "table" => format!("{table_prefix}/{table_part}"),
+            "table_unique" => format!("{table_prefix}/{table_part}/{}", unique()),
+            "schema_table" => format!("{table_prefix}/{schema}/{table_part}"),
+            "schema_table_unique" => format!("{table_prefix}/{schema}/{table_part}/{}", unique()),
+            other => {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!(
+                        "generate_s3_location: unknown s3_data_naming '{other}' (expected unique, \
+                         table, table_unique, schema_table or schema_table_unique)"
+                    ),
+                ));
+            }
+        };
+        Ok(Value::from(location))
+    }
+
+    /// dbt-athena `is_work_group_output_location_enforced`. Answering
+    /// truthfully needs the Athena GetWorkGroup API, which Fusion cannot call
+    /// yet; `false` is what dbt-athena returns with `skip_workgroup_check`,
+    /// and it only makes the macros emit an explicit table location, which is
+    /// always valid.
+    pub fn athena_is_work_group_output_location_enforced(
+        &self,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("is_work_group_output_location_enforced")?;
+        let iter = ArgsIter::new("is_work_group_output_location_enforced", &[], args);
+        iter.finish()?;
+        Ok(Value::from(false))
+    }
+
+    /// dbt-athena `run_query_with_partitions_limit_catching`: run a statement
+    /// and return either the literal `TOO_MANY_OPEN_PARTITIONS` (so the macro
+    /// falls back to batched inserts) or a JSON summary of the execution.
+    pub fn athena_run_query_with_partitions_limit_catching(
+        &self,
+        state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("run_query_with_partitions_limit_catching")?;
+        let iter = ArgsIter::new("run_query_with_partitions_limit_catching", &["sql"], args);
+        let sql = iter.next_arg::<&str>()?;
+        iter.finish()?;
+
+        match self.execute(state, None, sql, false, false, None, None) {
+            Ok((response, _)) => Ok(Value::from(format!(
+                "{{\"rowcount\":{},\"data_scanned_in_bytes\":{}}}",
+                response.rows_affected_i64(),
+                response.bytes_processed().unwrap_or(0)
+            ))),
+            Err(e) if e.message().contains("TOO_MANY_OPEN_PARTITIONS") => {
+                Ok(Value::from("TOO_MANY_OPEN_PARTITIONS"))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// dbt-athena `get_glue_table_type`: `iceberg_table`, `table` or `view`
+    /// for an existing relation, `None` if it does not exist. Returned as
+    /// `{"value": ...}` so the macros' `.value` access works.
+    pub fn athena_get_glue_table_type(
+        &self,
+        state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("get_glue_table_type")?;
+        let iter = ArgsIter::new("get_glue_table_type", &["relation"], args);
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        iter.finish()?;
+
+        Ok(match self.athena_table_type(state, relation.as_ref())? {
+            Some(kind) => Value::from_iter([("value", Value::from(kind))]),
+            None => none_value(),
+        })
+    }
+
+    /// dbt-athena `clean_up_table` + `delete_from_glue_catalog`, which
+    /// together remove a table's S3 data and its Glue entry through the AWS
+    /// APIs. For Iceberg tables and views a SQL `DROP` reaches the same end
+    /// state (Athena's `DROP TABLE` on Iceberg deletes the data files), so
+    /// `clean_up_table` is a no-op and `delete_from_glue_catalog` issues the
+    /// drop. Hive tables are refused: `DROP TABLE` on an external Hive table
+    /// leaves the data behind, which dbt-athena would have deleted.
+    pub fn athena_clean_up_table(
+        &self,
+        state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("clean_up_table")?;
+        let iter = ArgsIter::new("clean_up_table", &["relation"], args);
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        iter.finish()?;
+
+        match self.athena_table_type(state, relation.as_ref())? {
+            Some("table") => self.athena_hive_drop_unsupported("clean_up_table", relation.as_ref()),
+            // Iceberg / view / missing: the data goes with the DROP that follows.
+            _ => Ok(Value::from(())),
+        }
+    }
+
+    pub fn athena_delete_from_glue_catalog(
+        &self,
+        state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("delete_from_glue_catalog")?;
+        let iter = ArgsIter::new("delete_from_glue_catalog", &["relation"], args);
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        iter.finish()?;
+
+        let schema = relation.schema_as_resolved_str()?;
+        let identifier = relation.identifier_as_resolved_str()?;
+        let sql = match self.athena_table_type(state, relation.as_ref())? {
+            None => return Ok(Value::from(())),
+            Some("view") => format!("drop view if exists \"{schema}\".\"{identifier}\""),
+            Some("iceberg_table") => format!("drop table if exists `{schema}`.`{identifier}`"),
+            Some(_) => {
+                return self.athena_hive_drop_unsupported("delete_from_glue_catalog", relation.as_ref());
+            }
+        };
+        self.execute(state, None, &sql, false, false, None, None)?;
+        Ok(Value::from(()))
+    }
+
+    fn athena_hive_drop_unsupported(
+        &self,
+        name: &str,
+        relation: &dyn BaseRelation,
+    ) -> Result<Value, minijinja::Error> {
+        Err(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!(
+                "adapter.{name}: {} is a Hive table; dropping it means deleting its S3 data \
+                 through the S3 API, which Fusion cannot call yet. Iceberg tables and views \
+                 are dropped through SQL.",
+                relation.render_self_as_str()
+            ),
+        ))
+    }
+
+    /// Classify an existing Athena relation as `iceberg_table`, `table` (Hive)
+    /// or `view`; `None` when it does not exist. dbt-athena reads the Glue
+    /// table's `table_type` parameter; without a Glue client the same fact
+    /// comes from `SHOW CREATE TABLE`: Iceberg DDL carries
+    /// `'table_type'='ICEBERG'` in TBLPROPERTIES and no `ROW FORMAT` /
+    /// `STORED AS` clauses, Hive DDL is `CREATE EXTERNAL TABLE ... ROW FORMAT
+    /// ... STORED AS ...`. The first output row is not relied upon: the
+    /// Athena ADBC driver drops it (it treats row 0 as a column header, which
+    /// is right for SELECT results and wrong for SHOW).
+    fn athena_table_type(
+        &self,
+        state: &State,
+        relation: &dyn BaseRelation,
+    ) -> Result<Option<&'static str>, minijinja::Error> {
+        if relation.relation_type() == Some(RelationType::View) {
+            return Ok(Some("view"));
+        }
+        let sql = format!(
+            "show create table `{}`.`{}`",
+            relation.schema_as_resolved_str()?,
+            relation.identifier_as_resolved_str()?
+        );
+        let (_, table) = match self.execute(state, None, &sql, false, true, None, None) {
+            Ok(result) => result,
+            Err(e) if e.message().contains("does not exist")
+                || e.message().contains("not found")
+                || e.message().contains("EntityNotFoundException") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let batch = table.original_record_batch();
+        let lines: Vec<String> = batch
+            .columns()
+            .first()
+            .map(|col| {
+                (0..batch.num_rows())
+                    .filter_map(|i| arrow::util::display::array_value_to_string(col, i).ok())
+                    .map(|line| line.trim().to_ascii_uppercase())
+                    .filter(|line| !line.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        let any = |pred: &dyn Fn(&str) -> bool| lines.iter().any(|l| pred(l));
+        if any(&|l| l.starts_with("CREATE VIEW")) {
+            Ok(Some("view"))
+        } else if any(&|l| l.contains("'TABLE_TYPE'='ICEBERG'")) {
+            Ok(Some("iceberg_table"))
+        } else if any(&|l| {
+            l.starts_with("CREATE EXTERNAL TABLE")
+                || l.starts_with("ROW FORMAT")
+                || l.starts_with("STORED AS")
+                || l.starts_with("INPUTFORMAT")
+        }) {
+            Ok(Some("table"))
+        } else {
+            // Iceberg DDL without the property line (older engine output).
+            Ok(Some("iceberg_table"))
+        }
     }
 
     fn ensure_athena(&self, name: &str) -> Result<(), minijinja::Error> {
@@ -4034,6 +4326,15 @@ impl Adapter {
                 let model = iter.next_arg::<&Value>()?;
                 iter.finish()?;
 
+                // Athena: no catalog integration is wired (dbt-athena itself
+                // returns None without a catalogs.yml entry), so the macros
+                // take their `catalog_relation is none` branches: table_type
+                // from config or 'hive', format from config or 'parquet',
+                // location from config or `target.s3_data_dir`.
+                if self.adapter_type() == AdapterType::Athena {
+                    return Ok(none_value());
+                }
+
                 // Case 1: caller passed a plain string (CLD name) -- this is a hack for
                 // incremental polaris model. TODO: remove this when catalog_relation is
                 // fully engineered to no longer require runtime attribute shim-based solutions
@@ -4487,11 +4788,33 @@ impl Adapter {
             | "add_lf_tags_to_database"
             | "apply_lf_grants"
             | "persist_docs_to_glue" => self.athena_glue_metadata_noop(name),
-            "clean_up_table"
-            | "clean_up_partitions"
-            | "delete_from_glue_catalog"
-            | "delete_from_s3"
-            | "drop_glue_database" => self.athena_glue_unsupported(name),
+            // `delete_from_s3` clears a table location before CTAS. With a
+            // `*_unique` s3_data_naming (dbt-athena's default) the location is
+            // a fresh UUID prefix and the delete is a no-op; for a reused
+            // location Athena's CTAS itself refuses a non-empty directory, so
+            // skipping can fail loudly but never corrupt. Warn and skip.
+            "delete_from_s3" => self.athena_glue_metadata_noop(name),
+            "clean_up_table" => self.athena_clean_up_table(state, args),
+            "delete_from_glue_catalog" => self.athena_delete_from_glue_catalog(state, args),
+            "clean_up_partitions" | "swap_table" | "drop_glue_database" => {
+                self.athena_glue_unsupported(name)
+            }
+            // dbt-athena Python-side helpers that need no AWS API.
+            "generate_s3_location" => self.athena_generate_s3_location(state, args),
+            "is_work_group_output_location_enforced" => {
+                self.athena_is_work_group_output_location_enforced(args)
+            }
+            "run_query_with_partitions_limit_catching" => {
+                self.athena_run_query_with_partitions_limit_catching(state, args)
+            }
+            "get_glue_table_type" => self.athena_get_glue_table_type(state, args),
+            "is_list" => {
+                self.ensure_athena(name)?;
+                let iter = ArgsIter::new(name, &["value"], args);
+                let value = iter.next_arg::<&Value>()?;
+                iter.finish()?;
+                Ok(Value::from(value.kind() == ValueKind::Seq))
+            }
             _ => Err(minijinja::Error::new(
                 minijinja::ErrorKind::UnknownMethod,
                 format!("Unknown method on adapter object: '{name}'"),

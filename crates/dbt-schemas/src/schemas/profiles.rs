@@ -1926,6 +1926,9 @@ pub struct ExasolTargetEnv {
 pub struct AthenaTargetEnv {
     pub region_name: Option<String>,
     pub s3_staging_dir: Option<String>,
+    pub s3_data_dir: Option<String>,
+    pub s3_data_naming: Option<String>,
+    pub s3_tmp_table_dir: Option<String>,
     pub work_group: Option<String>,
     pub __common__: CommonTargetContext,
 }
@@ -2359,6 +2362,9 @@ impl TryFrom<DbConfig> for TargetContext {
             DbConfig::Athena(config) => Ok(TargetContext::Athena(AthenaTargetEnv {
                 region_name: config.region_name.clone(),
                 s3_staging_dir: config.s3_staging_dir.clone(),
+                s3_data_dir: config.s3_data_dir.clone(),
+                s3_data_naming: config.s3_data_naming.clone(),
+                s3_tmp_table_dir: config.s3_tmp_table_dir.clone(),
                 work_group: config.work_group.clone(),
                 __common__: CommonTargetContext {
                     // dbt-athena defaults the catalog to awsdatacatalog.

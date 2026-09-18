@@ -110,6 +110,13 @@ impl AdapterResponse {
         u64::try_from(self.rows_affected_i64()).unwrap_or(0)
     }
 
+    /// Bytes scanned by the statement, when the backend reported it.
+    pub fn bytes_processed(&self) -> Option<i64> {
+        self.0
+            .get(&Value::from(KEY_BYTES_PROCESSED))
+            .and_then(|v| v.as_i64())
+    }
+
     /// Raw rows-affected value; negative (e.g. `-1`) means unknown.
     pub fn rows_affected_i64(&self) -> i64 {
         self.0

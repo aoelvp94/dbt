@@ -12,6 +12,7 @@ pub mod spark;
 pub mod factory;
 
 mod relation_impl;
+pub use relation_impl::{ATHENA_S3_PATH_TABLE_PART, athena_s3_path_table_part};
 pub use relation_impl::{Relation, RelationStatic};
 
 mod relation_object;
