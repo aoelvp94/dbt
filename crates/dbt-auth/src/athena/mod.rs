@@ -71,12 +71,12 @@ const HARD_ERROR_UNSUPPORTED_FIELDS: &[&str] = &[
     "assume_role_duration_seconds",
 ];
 
+// `s3_data_dir`, `s3_data_naming` and `s3_tmp_table_dir` are deliberately
+// absent: they never reach the driver. The macros read them from `target`
+// (see `AthenaTargetEnv`) to compute table locations.
 const NOT_YET_SUPPORTED_FIELDS: &[&str] = &[
     "endpoint_url",
     "skip_workgroup_check",
-    "s3_data_dir",
-    "s3_data_naming",
-    "s3_tmp_table_dir",
     "poll_interval",
     "debug_query_state",
     "num_retries",
@@ -499,13 +499,16 @@ mod tests {
     }
 
     #[test]
-    fn test_s3_data_dir_returns_error() {
+    fn test_s3_location_fields_are_accepted() {
+        // Consumed by the materialization macros via `target`, never sent to
+        // the driver, so they must not trip the connect-time gate.
         let mut config = base_required();
         config.insert("s3_data_dir".into(), "s3://mybucket/data/".into());
+        config.insert("s3_data_naming".into(), "schema_table_unique".into());
+        config.insert("s3_tmp_table_dir".into(), "s3://mybucket/tmp/".into());
 
-        let err = AthenaAuth::new(Box::new(crate::NoopAuthWarningPrinter))
+        AthenaAuth::new(Box::new(crate::NoopAuthWarningPrinter))
             .configure(&AdapterConfig::new(config))
-            .expect_err("s3_data_dir should be rejected");
-        assert!(err.msg().contains("s3_data_dir"), "got: {}", err.msg());
+            .expect("S3 location fields should be accepted");
     }
 }

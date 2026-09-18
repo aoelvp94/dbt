@@ -37,6 +37,19 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Metadata key under which an Athena relation carries dbt-athena's
+/// `s3_path_table_part` (see `AthenaRelation` in dbt-athena's `relation.py`).
+pub const ATHENA_S3_PATH_TABLE_PART: &str = "s3_path_table_part";
+
+/// dbt-athena's `AthenaRelation.s3_path_table_part`, if this relation carries one.
+pub fn athena_s3_path_table_part(relation: &dyn BaseRelation) -> Option<String> {
+    relation
+        .as_any()
+        .downcast_ref::<Relation>()
+        .and_then(|r| r.metadata.as_ref())
+        .and_then(|m| m.get(ATHENA_S3_PATH_TABLE_PART).cloned())
+}
+
 fn include_policy(adapter_type: AdapterType, path: &RelationPath) -> Policy {
     match adapter_type {
         AdapterType::DuckDB => Policy::new(
@@ -122,6 +135,50 @@ impl StaticBaseRelation for RelationStatic {
                     .validate()?;
                 let rel = RelationObject::new(Arc::new(relation));
                 Ok(Value::from_object(rel))
+            }
+            AdapterType::Athena => {
+                // dbt-athena's AthenaRelation carries `s3_path_table_part`: the
+                // table-name component of the S3 location, which lets a
+                // `__ha` / `__dbt_tmp` relation write under the *target*
+                // table's prefix so the final rename is metadata-only. Kept
+                // in `metadata` so `incorporate` / `make_temp_relation`
+                // preserve it.
+                let iter = ArgsIter::new("Relation.create", &[], args);
+                let database = iter.next_kwarg::<Option<String>>("database")?;
+                let schema = iter.next_kwarg::<Option<String>>("schema")?;
+                let identifier = iter.next_kwarg::<Option<String>>("identifier")?;
+                let relation_type = iter.next_kwarg::<Option<Value>>("type")?;
+                let custom_quoting = iter.next_kwarg::<Option<Value>>("quote_policy")?;
+                let temporary = iter.next_kwarg::<Option<bool>>("temporary")?;
+                let s3_path_table_part =
+                    iter.next_kwarg::<Option<String>>("s3_path_table_part")?;
+                iter.finish()?;
+
+                let custom_quoting = custom_quoting
+                    .and_then(|v| DbtQuoting::deserialize(v).ok())
+                    .map(|v| ResolvedQuoting {
+                        database: v.database.unwrap_or_default(),
+                        identifier: v.identifier.unwrap_or_default(),
+                        schema: v.schema.unwrap_or_default(),
+                    });
+                let relation_type = relation_type.and_then(|v: Value| {
+                    if v.is_none() || v.is_undefined() {
+                        None
+                    } else {
+                        Some(RelationType::from(v.as_str().unwrap_or_default()))
+                    }
+                });
+                let metadata = s3_path_table_part.map(|part| {
+                    BTreeMap::from([(ATHENA_S3_PATH_TABLE_PART.to_string(), part)])
+                });
+
+                Relation::new(self.adapter_type, database, schema, identifier)
+                    .with_relation_type(relation_type)
+                    .with_quoting(custom_quoting.unwrap_or(self.quoting))
+                    .with_temporary(temporary.unwrap_or(false))
+                    .with_metadata(metadata)
+                    .validate()
+                    .map(|r| RelationObject::new(Arc::new(r)).into_value())
             }
             _ => {
                 let iter = ArgsIter::new("Relation.create", &[], args);
