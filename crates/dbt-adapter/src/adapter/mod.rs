@@ -241,6 +241,45 @@ impl Adapter {
         Ok(Value::from(true))
     }
 
+    /// Athena: Glue / Lake Formation metadata side effects that dbt-athena
+    /// performs through boto3 (table-version pruning, LF tags, LF grants,
+    /// column docs on the Glue table). Fusion has no Glue client yet, so these
+    /// are skipped with a warning. Skipping them never changes data or the
+    /// catalog entry; it only leaves governance metadata unapplied.
+    pub fn athena_glue_metadata_noop(&self, name: &str) -> Result<Value, minijinja::Error> {
+        self.ensure_athena(name)?;
+        tracing::warn!(
+            "adapter.{name} is not yet supported on the Athena adapter: skipped \
+             (Glue / Lake Formation metadata left unapplied)"
+        );
+        Ok(Value::from(()))
+    }
+
+    /// Athena: Glue / S3 operations that remove data or catalog entries.
+    /// Deliberately NOT stubbed as no-ops: a drop or full refresh that
+    /// silently skipped them would report success while the table remained.
+    pub fn athena_glue_unsupported(&self, name: &str) -> Result<Value, minijinja::Error> {
+        self.ensure_athena(name)?;
+        Err(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!(
+                "adapter.{name} is not yet supported on the Athena adapter: it removes data or \
+                 catalog entries through the Glue / S3 APIs, which Fusion cannot call yet"
+            ),
+        ))
+    }
+
+    fn ensure_athena(&self, name: &str) -> Result<(), minijinja::Error> {
+        if self.adapter_type() == AdapterType::Athena {
+            Ok(())
+        } else {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::UnknownMethod,
+                format!("Unknown method on adapter object: '{name}'"),
+            ))
+        }
+    }
+
     /// Execute a statement, expect no results.
     pub fn exec_stmt(
         &self,
@@ -4439,6 +4478,20 @@ impl Adapter {
                 iter.finish()?;
                 self.render_equals(state, expr1, expr2)
             }
+            // dbt-athena Glue / Lake Formation housekeeping (Python-side in
+            // dbt-athena). Metadata-only calls are skipped with a warning;
+            // calls that remove data or catalog entries stay hard errors so a
+            // drop or full refresh can never silently succeed without dropping.
+            "expire_glue_table_versions"
+            | "add_lf_tags"
+            | "add_lf_tags_to_database"
+            | "apply_lf_grants"
+            | "persist_docs_to_glue" => self.athena_glue_metadata_noop(name),
+            "clean_up_table"
+            | "clean_up_partitions"
+            | "delete_from_glue_catalog"
+            | "delete_from_s3"
+            | "drop_glue_database" => self.athena_glue_unsupported(name),
             _ => Err(minijinja::Error::new(
                 minijinja::ErrorKind::UnknownMethod,
                 format!("Unknown method on adapter object: '{name}'"),
