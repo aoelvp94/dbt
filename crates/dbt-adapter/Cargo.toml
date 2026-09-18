@@ -47,6 +47,9 @@ dashmap = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
 fancy-regex = { workspace = true }
 flate2 = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-glue = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 md5 = { workspace = true }

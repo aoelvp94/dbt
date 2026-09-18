@@ -14,6 +14,8 @@
 //! not expose a last-altered timestamp through `information_schema`, and
 //! dbt-athena's own implementation reads it from S3 object metadata.
 
+pub(crate) mod aws;
+
 use crate::AdapterEngine;
 use crate::adapter::adapter_impl::AdapterImpl;
 use crate::connection::AdapterConnectionFactory;

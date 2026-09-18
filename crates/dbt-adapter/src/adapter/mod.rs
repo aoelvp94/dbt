@@ -44,6 +44,7 @@ use minijinja::listener::RenderingEventListener;
 use minijinja::value::mutable_vec::MutableVec;
 use minijinja::value::{Object, ValueKind};
 use dbt_schemas::dbt_types::RelationType;
+use crate::metadata::athena::aws;
 use minijinja::{State, Value};
 use serde::Deserialize;
 use tracing;
@@ -302,10 +303,34 @@ impl Adapter {
         let is_temporary_table = iter.next_arg::<Option<bool>>()?.unwrap_or(false);
         iter.finish()?;
 
+        self.athena_s3_location(
+            state,
+            relation.as_ref(),
+            s3_data_dir,
+            s3_data_naming,
+            s3_tmp_table_dir,
+            external_location,
+            is_temporary_table,
+        )
+        .map(Value::from)
+    }
+
+    /// Core of `generate_s3_location`, shared with `upload_seed_to_s3`.
+    #[allow(clippy::too_many_arguments)]
+    fn athena_s3_location(
+        &self,
+        state: &State,
+        relation: &dyn BaseRelation,
+        s3_data_dir: Option<String>,
+        s3_data_naming: Option<String>,
+        s3_tmp_table_dir: Option<String>,
+        external_location: Option<String>,
+        is_temporary_table: bool,
+    ) -> Result<String, minijinja::Error> {
         if let Some(external) = external_location
             && !is_temporary_table
         {
-            return Ok(Value::from(external.trim_end_matches('/').to_string()));
+            return Ok(external.trim_end_matches('/').to_string());
         }
 
         let target = state.lookup("target", &[]).ok_or_else(|| {
@@ -341,8 +366,7 @@ impl Adapter {
         let table_prefix = table_prefix.trim_end_matches('/').to_string();
 
         let identifier = relation.identifier_as_resolved_str()?;
-        let table_part = crate::relation::athena_s3_path_table_part(relation.as_ref())
-            .unwrap_or(identifier);
+        let table_part = crate::relation::athena_s3_path_table_part(relation).unwrap_or(identifier);
         let schema = relation.schema_as_resolved_str()?;
         // dbt-athena defaults `s3_data_naming` to schema_table_unique.
         let naming = s3_data_naming
@@ -366,7 +390,7 @@ impl Adapter {
                 ));
             }
         };
-        Ok(Value::from(location))
+        Ok(location)
     }
 
     /// dbt-athena `is_work_group_output_location_enforced`. Answering
@@ -448,8 +472,19 @@ impl Adapter {
         let relation = downcast_value_to_dyn_base_relation(relation)?;
         iter.finish()?;
 
-        match self.athena_table_type(state, relation.as_ref())? {
-            Some("table") => self.athena_hive_drop_unsupported("clean_up_table", relation.as_ref()),
+        match self.athena_table_info(state, relation.as_ref())? {
+            // Hive: `DROP TABLE` only removes the catalog entry, so delete the
+            // data under the table location first, as dbt-athena does.
+            Some(AthenaTableInfo { kind: "table", location: Some(location) }) => {
+                let (bucket, prefix) = aws::parse_s3_path(&location)?;
+                let clients = aws::clients(self.engine().get_config())?;
+                let n = aws::delete_prefix(&clients, &bucket, &prefix)?;
+                tracing::debug!("clean_up_table: deleted {n} object(s) under {location}");
+                Ok(Value::from(()))
+            }
+            Some(AthenaTableInfo { kind: "table", location: None }) => {
+                self.athena_hive_drop_unsupported("clean_up_table", relation.as_ref())
+            }
             // Iceberg / view / missing: the data goes with the DROP that follows.
             _ => Ok(Value::from(())),
         }
@@ -471,10 +506,10 @@ impl Adapter {
         let sql = match self.athena_table_type(state, relation.as_ref())? {
             None => return Ok(Value::from(())),
             Some("view") => format!("drop view if exists \"{schema}\".\"{identifier}\""),
-            Some("iceberg_table") => format!("drop table if exists `{schema}`.`{identifier}`"),
-            Some(_) => {
-                return self.athena_hive_drop_unsupported("delete_from_glue_catalog", relation.as_ref());
-            }
+            // Iceberg: DROP TABLE removes data and catalog entry. Hive: the
+            // external table's data was removed by `clean_up_table`; this is
+            // the catalog entry.
+            Some(_) => format!("drop table if exists `{schema}`.`{identifier}`"),
         };
         self.execute(state, None, &sql, false, false, None, None)?;
         Ok(Value::from(()))
@@ -510,8 +545,17 @@ impl Adapter {
         state: &State,
         relation: &dyn BaseRelation,
     ) -> Result<Option<&'static str>, minijinja::Error> {
+        Ok(self.athena_table_info(state, relation)?.map(|info| info.kind))
+    }
+
+    /// Table kind plus, for tables, the S3 location from the DDL.
+    fn athena_table_info(
+        &self,
+        state: &State,
+        relation: &dyn BaseRelation,
+    ) -> Result<Option<AthenaTableInfo>, minijinja::Error> {
         if relation.relation_type() == Some(RelationType::View) {
-            return Ok(Some("view"));
+            return Ok(Some(AthenaTableInfo { kind: "view", location: None }));
         }
         let schema = relation.schema_as_resolved_str()?;
         let identifier = relation.identifier_as_resolved_str()?;
@@ -537,7 +581,7 @@ impl Adapter {
             .and_then(|col| arrow::util::display::array_value_to_string(col, 0).ok())
             .is_some_and(|t| t.trim().eq_ignore_ascii_case("VIEW"));
         if is_view {
-            return Ok(Some("view"));
+            return Ok(Some(AthenaTableInfo { kind: "view", location: None }));
         }
 
         // Comment-free on purpose: for Hive tables Athena runs SHOW CREATE
@@ -562,22 +606,151 @@ impl Adapter {
         if lines.is_empty() {
             return Ok(None);
         }
+        // `LOCATION 's3://...'` -- the DDL is uppercased above, so re-read the
+        // original row for the path's case.
+        // Iceberg DDL: `LOCATION 's3://...'` on one line. Hive DDL: `LOCATION`
+        // on one line and the quoted path on the next.
+        let raw_lines: Vec<String> = (0..batch.num_rows())
+            .filter_map(|i| {
+                batch
+                    .columns()
+                    .first()
+                    .and_then(|col| arrow::util::display::array_value_to_string(col, i).ok())
+            })
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        let quoted = |line: &str| -> Option<String> {
+            let start = line.find('\'')? + 1;
+            let end = line[start..].find('\'')? + start;
+            Some(line[start..end].to_string())
+        };
+        let location = raw_lines
+            .iter()
+            .position(|line| line.to_ascii_uppercase().starts_with("LOCATION"))
+            .and_then(|i| {
+                quoted(&raw_lines[i]).or_else(|| raw_lines.get(i + 1).and_then(|l| quoted(l)))
+            });
         let any = |pred: &dyn Fn(&str) -> bool| lines.iter().any(|l| pred(l));
-        if any(&|l| l.starts_with("CREATE VIEW")) {
-            Ok(Some("view"))
+        let kind = if any(&|l| l.starts_with("CREATE VIEW")) {
+            "view"
         } else if any(&|l| l.contains("'TABLE_TYPE'='ICEBERG'")) {
-            Ok(Some("iceberg_table"))
+            "iceberg_table"
         } else if any(&|l| {
             l.starts_with("CREATE EXTERNAL TABLE")
                 || l.starts_with("ROW FORMAT")
                 || l.starts_with("STORED AS")
                 || l.starts_with("INPUTFORMAT")
         }) {
-            Ok(Some("table"))
+            "table"
         } else {
             // Iceberg DDL without the property line (older engine output).
-            Ok(Some("iceberg_table"))
-        }
+            "iceberg_table"
+        };
+        Ok(Some(AthenaTableInfo { kind, location }))
+    }
+
+    /// dbt-athena `delete_from_s3`: delete every object under an S3 prefix.
+    pub fn athena_delete_from_s3(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("delete_from_s3")?;
+        let iter = ArgsIter::new("delete_from_s3", &["s3_path"], args);
+        let path = iter.next_arg::<&str>()?;
+        iter.finish()?;
+        let (bucket, prefix) = aws::parse_s3_path(path)?;
+        let clients = aws::clients(self.engine().get_config())?;
+        let n = aws::delete_prefix(&clients, &bucket, &prefix)?;
+        tracing::debug!("delete_from_s3: deleted {n} object(s) under {path}");
+        Ok(Value::from(()))
+    }
+
+    /// dbt-athena `expire_glue_table_versions(relation, versions_to_keep, delete_s3)`.
+    pub fn athena_expire_glue_table_versions(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("expire_glue_table_versions")?;
+        let iter = ArgsIter::new(
+            "expire_glue_table_versions",
+            &["relation", "to_keep", "delete_s3"],
+            args,
+        );
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        let to_keep = iter.next_arg::<Option<i64>>()?.unwrap_or(4).max(1) as usize;
+        let delete_s3 = iter.next_arg::<Option<bool>>()?.unwrap_or(false);
+        iter.finish()?;
+        let clients = aws::clients(self.engine().get_config())?;
+        let (versions, objects) = aws::expire_table_versions(
+            &clients,
+            &relation.schema_as_resolved_str()?,
+            &relation.identifier_as_resolved_str()?,
+            to_keep,
+            delete_s3,
+        )?;
+        tracing::debug!(
+            "expire_glue_table_versions: {} kept {to_keep}, deleted {versions} version(s), {objects} S3 object(s)",
+            relation.render_self_as_str()
+        );
+        Ok(Value::from(()))
+    }
+
+    /// dbt-athena `upload_seed_to_s3(relation, agate_table, s3_data_dir,
+    /// s3_data_naming, external_location, seed_s3_upload_args)`: write the seed
+    /// as `<location>/<identifier>.csv` (header row, OpenCSVSerde-compatible)
+    /// and return the location. `seed_s3_upload_args` (boto3 ExtraArgs) is
+    /// accepted and ignored.
+    pub fn athena_upload_seed_to_s3(&self, state: &State, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("upload_seed_to_s3")?;
+        let iter = ArgsIter::new(
+            "upload_seed_to_s3",
+            &["relation", "agate_table", "s3_data_dir", "s3_data_naming", "external_location"],
+            args,
+        );
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        let table = iter.next_arg::<&Value>()?.downcast_object::<AgateTable>().ok_or_else(|| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                "upload_seed_to_s3: agate_table must be an AgateTable",
+            )
+        })?;
+        let s3_data_dir = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let s3_data_naming = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let external_location = iter.next_arg::<Option<String>>()?.filter(|s| !s.is_empty());
+        let _upload_args = iter.next_kwarg::<Option<Value>>("seed_s3_upload_args")?;
+        iter.finish()?;
+
+        let location = self.athena_s3_location(
+            state,
+            relation.as_ref(),
+            s3_data_dir,
+            s3_data_naming,
+            None,
+            external_location,
+            false,
+        )?;
+        let identifier = relation.identifier_as_resolved_str()?;
+        let (bucket, prefix) = aws::parse_s3_path(&location)?;
+        let key = format!("{}/{identifier}.csv", prefix.trim_end_matches('/'));
+
+        // OpenCSVSerde: comma, double quotes; header skipped by the DDL;
+        // timestamps rendered so `try_cast_timestamp`'s first pattern matches.
+        let batch = table.original_record_batch();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = arrow::csv::WriterBuilder::new()
+            .with_header(true)
+            .with_timestamp_format("%Y-%m-%d %H:%M:%S%.6f".to_string())
+            .with_date_format("%Y-%m-%d".to_string())
+            .build(&mut buf);
+        writer.write(&batch).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("upload_seed_to_s3: failed to render CSV: {e}"),
+            )
+        })?;
+        drop(writer);
+
+        let clients = aws::clients(self.engine().get_config())?;
+        aws::put_object(&clients, &bucket, &key, buf)?;
+        tracing::debug!("upload_seed_to_s3: wrote s3://{bucket}/{key}");
+        Ok(Value::from(location))
     }
 
     /// dbt-athena `format_partition_keys`: the partition expressions as a
@@ -1104,12 +1277,27 @@ impl Adapter {
     ) -> Result<Value, minijinja::Error> {
         match &self.inner {
             Typed { adapter, .. } => {
-                let iter = ArgsIter::new("quote_seed_column", &["column", "quote_config"], args);
+                // dbt-athena adds a third parameter, `quote_character`: its
+                // seed DDL is Hive and needs backticks where DML uses `"`.
+                let iter = ArgsIter::new(
+                    "quote_seed_column",
+                    &["column", "quote_config", "quote_character"],
+                    args,
+                );
                 let column = iter.next_arg::<&str>()?;
                 let quote_config = iter.next_kwarg::<Option<bool>>("quote_config")?;
+                let quote_character = iter
+                    .next_kwarg::<Option<&str>>("quote_character")?
+                    .filter(|c| !c.is_empty());
                 iter.finish()?;
 
                 let result = adapter.quote_seed_column(state, column, quote_config)?;
+                let result = match quote_character {
+                    Some(qc) if result.len() >= 2 && result.starts_with('"') && result.ends_with('"') => {
+                        format!("{qc}{}{qc}", &result[1..result.len() - 1])
+                    }
+                    _ => result,
+                };
                 Ok(Value::from(result))
             }
             Parse(_) => Ok(empty_string_value()),
@@ -4890,17 +5078,13 @@ impl Adapter {
             // dbt-athena). Metadata-only calls are skipped with a warning;
             // calls that remove data or catalog entries stay hard errors so a
             // drop or full refresh can never silently succeed without dropping.
-            "expire_glue_table_versions"
-            | "add_lf_tags"
+            "add_lf_tags"
             | "add_lf_tags_to_database"
             | "apply_lf_grants"
             | "persist_docs_to_glue" => self.athena_glue_metadata_noop(name),
-            // `delete_from_s3` clears a table location before CTAS. With a
-            // `*_unique` s3_data_naming (dbt-athena's default) the location is
-            // a fresh UUID prefix and the delete is a no-op; for a reused
-            // location Athena's CTAS itself refuses a non-empty directory, so
-            // skipping can fail loudly but never corrupt. Warn and skip.
-            "delete_from_s3" => self.athena_glue_metadata_noop(name),
+            "expire_glue_table_versions" => self.athena_expire_glue_table_versions(args),
+            "delete_from_s3" => self.athena_delete_from_s3(args),
+            "upload_seed_to_s3" => self.athena_upload_seed_to_s3(state, args),
             "clean_up_table" => self.athena_clean_up_table(state, args),
             "delete_from_glue_catalog" => self.athena_delete_from_glue_catalog(state, args),
             "clean_up_partitions" | "swap_table" | "drop_glue_database" => {
@@ -5213,6 +5397,12 @@ impl Adapter {
     }
 }
 
+
+/// Result of `Adapter::athena_table_info`.
+struct AthenaTableInfo {
+    kind: &'static str,
+    location: Option<String>,
+}
 
 /// See [`Adapter::athena_format_one_partition_key`].
 fn athena_format_one_partition_key(partition_key: &str) -> String {
