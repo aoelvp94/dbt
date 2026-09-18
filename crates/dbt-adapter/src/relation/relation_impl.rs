@@ -38,7 +38,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Metadata key under which an Athena relation carries dbt-athena's
-/// `s3_path_table_part` (see `AthenaRelation` in dbt-athena's `relation.py`).
+/// `s3_path_table_part`.
+/// AthenaRelation https://github.com/dbt-labs/dbt-adapters/blob/4dc395b42dae78e895adf9c66ad6811534e879a6/dbt-athena/src/dbt/adapters/athena/relation.py#L40
 pub const ATHENA_S3_PATH_TABLE_PART: &str = "s3_path_table_part";
 
 /// dbt-athena's `AthenaRelation.s3_path_table_part`, if this relation carries one.
@@ -150,8 +151,7 @@ impl StaticBaseRelation for RelationStatic {
                 let relation_type = iter.next_kwarg::<Option<Value>>("type")?;
                 let custom_quoting = iter.next_kwarg::<Option<Value>>("quote_policy")?;
                 let temporary = iter.next_kwarg::<Option<bool>>("temporary")?;
-                let s3_path_table_part =
-                    iter.next_kwarg::<Option<String>>("s3_path_table_part")?;
+                let s3_path_table_part = iter.next_kwarg::<Option<String>>("s3_path_table_part")?;
                 iter.finish()?;
 
                 let custom_quoting = custom_quoting
@@ -168,9 +168,8 @@ impl StaticBaseRelation for RelationStatic {
                         Some(RelationType::from(v.as_str().unwrap_or_default()))
                     }
                 });
-                let metadata = s3_path_table_part.map(|part| {
-                    BTreeMap::from([(ATHENA_S3_PATH_TABLE_PART.to_string(), part)])
-                });
+                let metadata = s3_path_table_part
+                    .map(|part| BTreeMap::from([(ATHENA_S3_PATH_TABLE_PART.to_string(), part)]));
 
                 Relation::new(self.adapter_type, database, schema, identifier)
                     .with_relation_type(relation_type)

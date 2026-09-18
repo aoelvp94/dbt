@@ -211,7 +211,8 @@ impl Object for RelationObject {
                 self.get(&key, default)
             }
             "render" => Ok(render_without_filter(self)),
-            // dbt-athena `AthenaRelation.render_hive()`: Athena's Hive-style
+            // AthenaRelation.render_hive https://github.com/dbt-labs/dbt-adapters/blob/4dc395b42dae78e895adf9c66ad6811534e879a6/dbt-athena/src/dbt/adapters/athena/relation.py#L46
+            // Athena's Hive-style
             // DDL (CREATE/DROP/ALTER TABLE, CREATE SCHEMA) takes `schema`.`table`
             // with backticks and no catalog.
             "render_hive" if self.adapter_type() == AdapterType::Athena => {
@@ -223,7 +224,8 @@ impl Object for RelationObject {
                     .collect();
                 Ok(Value::from(parts.join(".")))
             }
-            // dbt-athena `AthenaRelation.render_pure()`: the full name with no
+            // AthenaRelation.render_pure https://github.com/dbt-labs/dbt-adapters/blob/4dc395b42dae78e895adf9c66ad6811534e879a6/dbt-athena/src/dbt/adapters/athena/relation.py#L64
+            // The full name with no
             // quoting at all, used by OPTIMIZE / VACUUM / ALTER ... ADD COLUMNS.
             "render_pure" if self.adapter_type() == AdapterType::Athena => {
                 let parts: Vec<&str> = [self.database(), self.schema(), self.identifier()]
@@ -434,7 +436,7 @@ impl Object for RelationObject {
             Some("is_refreshable") => Some(Value::from(self.is_refreshable())),
             Some("refreshable_append") => Some(Value::from(self.refreshable_append())),
 
-            // Athena (dbt-athena `AthenaRelation.s3_path_table_part`)
+            // AthenaRelation.s3_path_table_part https://github.com/dbt-labs/dbt-adapters/blob/4dc395b42dae78e895adf9c66ad6811534e879a6/dbt-athena/src/dbt/adapters/athena/relation.py#L40
             Some("s3_path_table_part") => Some(
                 crate::relation::relation_impl::athena_s3_path_table_part(self.relation.as_ref())
                     .map(Value::from)
@@ -1493,5 +1495,56 @@ mod tests {
                 .unwrap()
                 .is_true()
         );
+    }
+
+    mod athena {
+        use super::*;
+        use crate::relation::{ATHENA_S3_PATH_TABLE_PART, Relation};
+        use std::collections::BTreeMap;
+
+        fn relation_object(s3_path_table_part: Option<&str>) -> RelationObject {
+            let relation = Relation::new(
+                AdapterType::Athena,
+                Some("awsdatacatalog".to_string()),
+                Some("analytics".to_string()),
+                Some("orders__dbt_tmp".to_string()),
+            )
+            .with_metadata(s3_path_table_part.map(|part| {
+                BTreeMap::from([(ATHENA_S3_PATH_TABLE_PART.to_string(), part.to_string())])
+            }));
+            RelationObject::new(Arc::new(relation))
+        }
+
+        #[test]
+        fn render_hive_is_backticked_schema_table_without_catalog() {
+            jinja_assert(
+                relation_object(None),
+                "{{ obj.render_hive() }}",
+                "`analytics`.`orders__dbt_tmp`",
+            );
+        }
+
+        #[test]
+        fn render_pure_is_the_unquoted_full_name() {
+            jinja_assert(
+                relation_object(None),
+                "{{ obj.render_pure() }}",
+                "awsdatacatalog.analytics.orders__dbt_tmp",
+            );
+        }
+
+        #[test]
+        fn s3_path_table_part_reads_the_relation_metadata() {
+            jinja_assert(
+                relation_object(Some("orders")),
+                "{{ obj.s3_path_table_part }}",
+                "orders",
+            );
+            jinja_assert(
+                relation_object(None),
+                "{{ obj.s3_path_table_part is none }}",
+                "True",
+            );
+        }
     }
 }
