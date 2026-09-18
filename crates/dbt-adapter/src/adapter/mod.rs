@@ -513,21 +513,35 @@ impl Adapter {
         if relation.relation_type() == Some(RelationType::View) {
             return Ok(Some("view"));
         }
-        let sql = format!(
-            "show create table `{}`.`{}`",
-            relation.schema_as_resolved_str()?,
-            relation.identifier_as_resolved_str()?
+        let schema = relation.schema_as_resolved_str()?;
+        let identifier = relation.identifier_as_resolved_str()?;
+
+        // Existence first: `SHOW CREATE TABLE` on a missing table does not say
+        // "not found" -- Athena falls back to its Hive parser, which rejects the
+        // leading query comment with a ParseException. The macros call
+        // `drop_relation` on relation objects that may not exist yet.
+        let exists_sql = format!(
+            "select table_type from information_schema.tables \
+             where lower(table_schema) = '{}' and lower(table_name) = '{}' limit 1",
+            crate::metadata::athena::athena_string_literal(&schema),
+            crate::metadata::athena::athena_string_literal(&identifier)
         );
-        let (_, table) = match self.execute(state, None, &sql, false, true, None, None) {
-            Ok(result) => result,
-            Err(e) if e.message().contains("does not exist")
-                || e.message().contains("not found")
-                || e.message().contains("EntityNotFoundException") =>
-            {
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let (_, exists) = self.execute(state, None, &exists_sql, false, true, None, None)?;
+        let exists_batch = exists.original_record_batch();
+        if exists_batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let is_view = exists_batch
+            .columns()
+            .first()
+            .and_then(|col| arrow::util::display::array_value_to_string(col, 0).ok())
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("VIEW"));
+        if is_view {
+            return Ok(Some("view"));
+        }
+
+        let sql = format!("show create table `{schema}`.`{identifier}`");
+        let (_, table) = self.execute(state, None, &sql, false, true, None, None)?;
         let batch = table.original_record_batch();
         let lines: Vec<String> = batch
             .columns()
@@ -559,6 +573,67 @@ impl Adapter {
             // Iceberg DDL without the property line (older engine output).
             Ok(Some("iceberg_table"))
         }
+    }
+
+    /// dbt-athena `format_partition_keys`: the partition expressions as a
+    /// comma-separated select list for the distinct-partitions probe.
+    pub fn athena_format_partition_keys(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("format_partition_keys")?;
+        let iter = ArgsIter::new("format_partition_keys", &["partition_keys"], args);
+        let keys = iter.next_arg::<&Value>()?;
+        iter.finish()?;
+        let formatted: Vec<String> = keys
+            .try_iter()?
+            .map(|k| athena_format_one_partition_key(&k.to_string()))
+            .collect();
+        Ok(Value::from(formatted.join(", ")))
+    }
+
+    /// dbt-athena `format_one_partition_key`: Iceberg hidden partitioning
+    /// (`day(ts)` -> `date_trunc('day', ts)`), bucket partitioning
+    /// (`bucket(col, 16)` -> `col`), else the lowercased key.
+    pub fn athena_format_one_partition_key(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("format_one_partition_key")?;
+        let iter = ArgsIter::new("format_one_partition_key", &["partition_key"], args);
+        let key = iter.next_arg::<&str>()?;
+        iter.finish()?;
+        Ok(Value::from(athena_format_one_partition_key(key)))
+    }
+
+    /// dbt-athena `format_value_for_partition`: `(literal, comparison)` for a
+    /// partition value, e.g. `('DATE\'2026-09-01\'', '=')` or `('null', ' is ')`.
+    /// `column_type` comes from `adapter.convert_type`, so Fusion's Athena
+    /// spellings (`varchar`, `bigint`, ...) are accepted alongside dbt-athena's.
+    pub fn athena_format_value_for_partition(
+        &self,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("format_value_for_partition")?;
+        let iter = ArgsIter::new("format_value_for_partition", &["value", "column_type"], args);
+        let value = iter.next_arg::<&Value>()?;
+        let column_type = iter.next_arg::<&str>()?.trim().to_ascii_lowercase();
+        iter.finish()?;
+
+        let pair = |literal: String, op: &str| {
+            Value::from(vec![Value::from(literal), Value::from(op)])
+        };
+        if value.is_none() || value.is_undefined() {
+            return Ok(pair("null".to_string(), " is "));
+        }
+        let text = value.to_string();
+        let literal = match column_type.as_str() {
+            "integer" | "bigint" | "smallint" | "tinyint" | "int" => text,
+            "string" | "varchar" | "text" => format!("'{}'", text.replace('\'', "''")),
+            "date" => format!("DATE'{text}'"),
+            "timestamp" => format!("TIMESTAMP'{text}'"),
+            other => {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("format_value_for_partition: unsupported column type: {other}"),
+                ));
+            }
+        };
+        Ok(pair(literal, "="))
     }
 
     fn ensure_athena(&self, name: &str) -> Result<(), minijinja::Error> {
@@ -4808,6 +4883,13 @@ impl Adapter {
                 self.athena_run_query_with_partitions_limit_catching(state, args)
             }
             "get_glue_table_type" => self.athena_get_glue_table_type(state, args),
+            "format_partition_keys" => self.athena_format_partition_keys(args),
+            "format_one_partition_key" => self.athena_format_one_partition_key(args),
+            "format_value_for_partition" => self.athena_format_value_for_partition(args),
+            // Iceberg bucket partitions need MurmurHash3 over the Iceberg byte
+            // encoding of the value (dbt-athena uses mmh3); no crate in the
+            // workspace provides it yet.
+            "murmur3_hash" => self.athena_glue_unsupported(name),
             "is_list" => {
                 self.ensure_athena(name)?;
                 let iter = ArgsIter::new(name, &["value"], args);
@@ -5097,4 +5179,23 @@ impl Adapter {
             .get_relation(temp_relation)
             .map(|entry| RelationObject::new(entry.relation()).into_value()))
     }
+}
+
+
+/// See [`Adapter::athena_format_one_partition_key`].
+fn athena_format_one_partition_key(partition_key: &str) -> String {
+    let lower = partition_key.trim().to_ascii_lowercase();
+    for unit in ["hour", "day", "month", "year"] {
+        if let Some(rest) = lower.strip_prefix(&format!("{unit}("))
+            && let Some(inner) = rest.strip_suffix(')')
+        {
+            return format!("date_trunc('{unit}', {inner})");
+        }
+    }
+    if let Some(rest) = lower.strip_prefix("bucket(")
+        && let Some((col, _)) = rest.split_once(',')
+    {
+        return col.trim().to_string();
+    }
+    lower
 }
