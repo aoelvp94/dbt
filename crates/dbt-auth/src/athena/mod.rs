@@ -73,13 +73,14 @@ const HARD_ERROR_UNSUPPORTED_FIELDS: &[&str] = &[
 
 // `s3_data_dir`, `s3_data_naming` and `s3_tmp_table_dir` are deliberately
 // absent: they never reach the driver. The macros read them from `target`
-// (see `AthenaTargetEnv`) to compute table locations.
+// (see `AthenaTargetEnv`) to compute table locations. `num_retries` is also
+// accepted (and ignored): dbt-athena's default profile template ships it, the
+// Go driver has no retry knob, and the AWS SDK it embeds retries on its own.
 const NOT_YET_SUPPORTED_FIELDS: &[&str] = &[
     "endpoint_url",
     "skip_workgroup_check",
     "poll_interval",
     "debug_query_state",
-    "num_retries",
     "num_boto3_retries",
     "num_iceberg_retries",
     "spark_work_group",
