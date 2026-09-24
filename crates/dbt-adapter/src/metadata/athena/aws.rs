@@ -41,6 +41,40 @@ fn aws_error_msg(op: &str, detail: impl std::fmt::Display) -> AdapterError {
     AdapterError::new(AdapterErrorKind::Driver, format!("[athena/aws] {op} failed: {detail}"))
 }
 
+/// True when a Glue call failed because the database or table does not exist.
+///
+/// Matched on the modelled service error, not on `Display`: an `SdkError`
+/// renders as a one-word category ("service error"), so a string test never
+/// fires and a missing database surfaces as a hard failure instead of an
+/// empty result.
+fn is_entity_not_found<E, R>(err: &aws_sdk_glue::error::SdkError<E, R>) -> bool
+where
+    E: EntityNotFound,
+{
+    err.as_service_error().is_some_and(EntityNotFound::is_entity_not_found)
+}
+
+/// The Glue operation errors that carry `EntityNotFoundException`.
+trait EntityNotFound {
+    fn is_entity_not_found(&self) -> bool;
+}
+
+macro_rules! impl_entity_not_found {
+    ($($err:ty),+ $(,)?) => {$(
+        impl EntityNotFound for $err {
+            fn is_entity_not_found(&self) -> bool {
+                self.is_entity_not_found_exception()
+            }
+        }
+    )+};
+}
+
+impl_entity_not_found!(
+    aws_sdk_glue::operation::get_table::GetTableError,
+    aws_sdk_glue::operation::get_tables::GetTablesError,
+    aws_sdk_glue::operation::get_table_versions::GetTableVersionsError,
+);
+
 fn aws_error(op: &str, e: impl std::error::Error) -> AdapterError {
     // `SdkError`'s Display is a one-word category ("dispatch failure"); the
     // context walker prints the cause chain (expired SSO token, DNS, TLS...).
@@ -347,7 +381,7 @@ pub fn glue_get_table(
     block_on(async move {
         match glue.get_table().database_name(&database).name(&name).send().await {
             Ok(out) => Ok(out.table().map(glue_table_info)),
-            Err(e) if e.to_string().contains("EntityNotFoundException") => Ok(None),
+            Err(e) if is_entity_not_found(&e) => Ok(None),
             Err(e) => Err(aws_error(&format!("GetTable {database}.{name}"), e)),
         }
     })
@@ -372,7 +406,7 @@ pub fn glue_list_tables(
             }
             let page = match req.send().await {
                 Ok(p) => p,
-                Err(e) if e.to_string().contains("EntityNotFoundException") => break,
+                Err(e) if is_entity_not_found(&e) => break,
                 Err(e) => return Err(aws_error(&format!("GetTables {database}"), e)),
             };
             out.extend(page.table_list().iter().map(glue_table_info));
@@ -424,7 +458,7 @@ pub fn glue_catalog_rows(
                 Ok(p) => p,
                 // A schema that does not exist yields no catalog rows, not an error
                 // (dbt hydrates the catalog for target schemas not yet created).
-                Err(e) if e.to_string().contains("EntityNotFoundException") => break,
+                Err(e) if is_entity_not_found(&e) => break,
                 Err(e) => return Err(aws_error(&format!("GetTables {database}"), e)),
             };
             for t in page.table_list() {
