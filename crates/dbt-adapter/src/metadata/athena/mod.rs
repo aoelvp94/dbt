@@ -327,16 +327,104 @@ impl MetadataAdapter for AthenaMetadataAdapter {
     }
 }
 
+/// Athena's Glue-backed catalog. The Glue API serves only this one: a relation
+/// in a federated connector or in S3 Tables (`s3tablescatalog/<bucket>`) has to
+/// be read through that catalog's own `information_schema`.
+const GLUE_CATALOG: &str = "awsdatacatalog";
+
+fn catalog_is_glue(catalog: &str) -> bool {
+    catalog.is_empty() || catalog.eq_ignore_ascii_case(GLUE_CATALOG)
+}
+
+/// The `list_relations` query for a schema, qualified with its catalog.
+///
+/// Athena's `information_schema` covers only the catalog it is read from, so
+/// the catalog belongs in the table reference, not only in a filter.
+fn list_relations_sql(catalog: &str, schema: &str) -> String {
+    let schema_literal = athena_string_literal(schema);
+    let catalog_filter = if catalog.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " and lower(table_catalog) = '{}'",
+            athena_string_literal(catalog)
+        )
+    };
+    let information_schema = if catalog.is_empty() {
+        "information_schema".to_string()
+    } else {
+        format!("\"{}\".information_schema", catalog.replace('"', "\"\""))
+    };
+    format!(
+        "select table_schema, table_name, table_type \
+         from {information_schema}.tables \
+         where lower(table_schema) = '{schema_literal}'{catalog_filter}"
+    )
+}
+
+/// List every table and view in a schema.
+///
+/// Glue `GetTables` first: milliseconds and free, where an `information_schema`
+/// query takes seconds and bills Athena's 10 MB minimum. Glue serves only the
+/// Data Catalog, so a relation in any other catalog falls back to that
+/// catalog's own `information_schema` — as does a Glue call that fails for any
+/// reason, since Lake Formation can deny `GetTables` on tables that stay
+/// perfectly queryable through Athena.
+///
+/// A schema that does not exist yields zero rows rather than an error, which is
+/// what cache hydration wants for not-yet-created target schemas.
 pub fn list_relations(
     engine: &dyn AdapterEngine,
-    _ctx: &QueryCtx,
-    _conn: &'_ mut dyn Connection,
+    ctx: &QueryCtx,
+    conn: &'_ mut dyn Connection,
     db_schema: &CatalogAndSchema,
-    _token: CancellationToken,
+    token: CancellationToken,
 ) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
-    // Glue GetTables (paginated) rather than an Athena information_schema
-    // query: milliseconds instead of seconds, and a missing schema is an
-    // empty list rather than an error. Matches dbt-athena.
+    if catalog_is_glue(&db_schema.resolved_catalog) {
+        match list_relations_via_glue(engine, db_schema) {
+            Ok(relations) => return Ok(relations),
+            Err(e) => {
+                tracing::debug!(
+                    "Athena: Glue GetTables for schema '{}' failed ({e}); falling back to information_schema",
+                    db_schema.resolved_schema
+                );
+            }
+        }
+    }
+
+    let sql = list_relations_sql(&db_schema.resolved_catalog, &db_schema.resolved_schema);
+    let batch = engine.execute(None, conn, ctx, &sql, token)?;
+
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let table_schemas = batch.column_values::<StringArray>("table_schema")?;
+    let table_names = batch.column_values::<StringArray>("table_name")?;
+    let table_types = batch.column_values::<StringArray>("table_type")?;
+
+    let mut relations = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let relation = Relation::new(
+            engine.adapter_type(),
+            Some(db_schema.resolved_catalog.clone()),
+            Some(table_schemas.value(i).to_string()),
+            Some(table_names.value(i).to_string()),
+        )
+        .with_relation_type(relation_type_from_table_type(table_types.value(i)))
+        .with_quoting(engine.quoting());
+
+        relations.push(Arc::new(relation) as Arc<dyn BaseRelation>);
+    }
+
+    Ok(relations)
+}
+
+/// The Glue path: `GetTables`, paginated, no Athena query at all.
+fn list_relations_via_glue(
+    engine: &dyn AdapterEngine,
+    db_schema: &CatalogAndSchema,
+) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
     let clients = aws::clients(engine.get_config())?;
     let tables = aws::glue_list_tables(&clients, &db_schema.resolved_schema)?;
     Ok(tables
@@ -367,6 +455,31 @@ mod tests {
     fn literals_are_lowercased_and_quote_escaped() {
         assert_eq!(athena_string_literal("Analytics_Bronze_QA"), "analytics_bronze_qa");
         assert_eq!(athena_string_literal("o'neil"), "o''neil");
+    }
+
+    #[test]
+    fn glue_serves_only_the_data_catalog() {
+        assert!(catalog_is_glue(""));
+        assert!(catalog_is_glue("awsdatacatalog"));
+        assert!(catalog_is_glue("AwsDataCatalog"));
+        assert!(!catalog_is_glue("s3tablescatalog/lab-bucket"));
+    }
+
+    #[test]
+    fn list_relations_sql_reads_the_information_schema_of_the_catalog() {
+        assert_eq!(
+            list_relations_sql("s3tablescatalog/lab-bucket", "Analytics"),
+            "select table_schema, table_name, table_type \
+             from \"s3tablescatalog/lab-bucket\".information_schema.tables \
+             where lower(table_schema) = 'analytics' \
+             and lower(table_catalog) = 's3tablescatalog/lab-bucket'"
+        );
+        assert_eq!(
+            list_relations_sql("", "analytics"),
+            "select table_schema, table_name, table_type \
+             from information_schema.tables \
+             where lower(table_schema) = 'analytics'"
+        );
     }
 
     #[test]

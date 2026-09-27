@@ -1,10 +1,30 @@
 {#- dbt-athena reads columns from Glue (get_columns_in_relation override).
-    The Rust adapter exposes that as get_glue_table_columns, returning the
-    information_schema.columns shape sql_convert_columns_in_relation expects.
-    It must not call adapter.get_columns_in_relation: Fusion runs this macro
-    from that very method. -#}
+    Fusion runs this macro from AdapterImpl::get_columns_in_relation, so
+    delegating back to adapter.get_columns_in_relation would recurse.
+
+    Glue first: get_glue_table_columns is one free API call, where the
+    information_schema query bills Athena's 10 MB minimum per relation. Glue
+    serves only the Data Catalog, so a relation in another catalog (S3 Tables:
+    s3tablescatalog/<bucket>) reads that catalog's own information_schema —
+    Trino's has no length/precision/scale, hence the null casts. -#}
 {% macro athena__get_columns_in_relation(relation) -%}
-  {{ return(sql_convert_columns_in_relation(adapter.get_glue_table_columns(relation))) }}
+  {%- set catalog = relation.database -%}
+  {%- if catalog is none or catalog | lower == 'awsdatacatalog' -%}
+    {{ return(sql_convert_columns_in_relation(adapter.get_glue_table_columns(relation))) }}
+  {%- endif -%}
+  {% call statement('get_columns_in_relation', fetch_result=True) %}
+    select
+        column_name,
+        data_type,
+        cast(null as integer) as character_maximum_length,
+        cast(null as integer) as numeric_precision,
+        cast(null as integer) as numeric_scale
+    from "{{ catalog }}".information_schema.columns
+    where lower(table_name) = '{{ relation.identifier | lower }}'
+      and lower(table_schema) = '{{ relation.schema | lower }}'
+  {% endcall %}
+  {% set table = load_result('get_columns_in_relation').table %}
+  {{ return(sql_convert_columns_in_relation(table)) }}
 {% endmacro %}
 
 {% macro athena__get_empty_schema_sql(columns) %}
