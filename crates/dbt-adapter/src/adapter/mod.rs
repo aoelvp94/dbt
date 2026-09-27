@@ -584,6 +584,32 @@ impl Adapter {
         Ok(Value::from(()))
     }
 
+    /// dbt-athena `swap_table`: repoint a target table at a source table's data.
+    ///
+    /// Used by the `ha` table materialization, which builds a tmp table and then
+    /// swaps it in so readers never see a dropped table. The macro deletes the tmp
+    /// table's catalog entry afterwards, without touching its data — the target now
+    /// owns it.
+    pub fn athena_swap_table(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("swap_table")?;
+        let iter = ArgsIter::new("swap_table", &["src_relation", "target_relation"], args);
+        let src = iter.next_arg::<&Value>()?;
+        let src = downcast_value_to_dyn_base_relation(src)?;
+        let target = iter.next_arg::<&Value>()?;
+        let target = downcast_value_to_dyn_base_relation(target)?;
+        iter.finish()?;
+
+        let clients = aws::clients(self.engine().get_config())?;
+        aws::glue_swap_table(
+            &clients,
+            &src.schema_as_resolved_str()?,
+            &src.identifier_as_resolved_str()?,
+            &target.schema_as_resolved_str()?,
+            &target.identifier_as_resolved_str()?,
+        )?;
+        Ok(Value::from(()))
+    }
+
     pub fn athena_is_s3_tables_database(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
         self.ensure_athena("is_s3_tables_database")?;
         let iter = ArgsIter::new("is_s3_tables_database", &["database"], args);
@@ -5207,7 +5233,8 @@ impl Adapter {
             "clean_up_table" => self.athena_clean_up_table(state, args),
             "delete_from_glue_catalog" => self.athena_delete_from_glue_catalog(state, args),
             "clean_up_partitions" => self.athena_clean_up_partitions(args),
-            "swap_table" | "drop_glue_database" => self.athena_glue_unsupported(name),
+            "swap_table" => self.athena_swap_table(args),
+            "drop_glue_database" => self.athena_glue_unsupported(name),
             // dbt-athena Python-side helpers that need no AWS API.
             "generate_s3_location" => self.athena_generate_s3_location(state, args),
             // dbt-athena builds the docs catalog from Glue, not information_schema.

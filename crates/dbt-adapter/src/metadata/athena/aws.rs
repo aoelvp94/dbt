@@ -474,6 +474,152 @@ pub fn glue_partition_locations(
     })
 }
 
+/// dbt-athena `swap_table`: point a target table at the data of a source table.
+///
+/// The `ha` materialization builds a tmp table, then swaps it in: the target's
+/// Glue definition takes the source's storage descriptor, partition keys, table
+/// type and parameters, so readers move to the new data in one catalog update
+/// rather than seeing a dropped table. The target's own partitions are then
+/// removed and the source's recreated against it, because partitions carry their
+/// own locations and would otherwise still point at the old data.
+///
+/// Batch sizes follow dbt-athena: 25 deletes, 100 creates.
+pub fn glue_swap_table(
+    clients: &Arc<AthenaAwsClients>,
+    src_database: &str,
+    src_name: &str,
+    target_database: &str,
+    target_name: &str,
+) -> AdapterResult<()> {
+    use aws_sdk_glue::types::{PartitionInput, PartitionValueList, TableInput};
+
+    let glue = clients.glue.clone();
+    let src_database = src_database.to_lowercase();
+    let src_name = src_name.to_lowercase();
+    let target_database = target_database.to_lowercase();
+    let target_name = target_name.to_lowercase();
+
+    block_on(async move {
+        let src = glue
+            .get_table()
+            .database_name(&src_database)
+            .name(&src_name)
+            .send()
+            .await
+            .map_err(|e| aws_error(&format!("GetTable {src_database}.{src_name}"), e))?
+            .table()
+            .cloned()
+            .ok_or_else(|| {
+                aws_error_msg("SwapTable", format!("{src_database}.{src_name} does not exist"))
+            })?;
+
+        let src_partitions = all_partitions(&glue, &src_database, &src_name).await?;
+        let target_partitions = all_partitions(&glue, &target_database, &target_name).await?;
+
+        let table_input = TableInput::builder()
+            .name(&target_name)
+            .set_storage_descriptor(src.storage_descriptor().cloned())
+            .set_partition_keys(Some(src.partition_keys().to_vec()))
+            .set_table_type(src.table_type().map(str::to_string))
+            .set_parameters(src.parameters().cloned())
+            .set_description(src.description().map(str::to_string))
+            .build()
+            .map_err(|e| aws_error("SwapTable TableInput", e))?;
+
+        glue.update_table()
+            .database_name(&target_database)
+            .table_input(table_input)
+            .send()
+            .await
+            .map_err(|e| {
+                aws_error(&format!("UpdateTable {target_database}.{target_name}"), e)
+            })?;
+
+        for chunk in target_partitions.chunks(25) {
+            let to_delete = chunk
+                .iter()
+                .map(|p| {
+                    PartitionValueList::builder()
+                        .set_values(Some(p.values().to_vec()))
+                        .build()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| aws_error("SwapTable PartitionValueList", e))?;
+            glue.batch_delete_partition()
+                .database_name(&target_database)
+                .table_name(&target_name)
+                .set_partitions_to_delete(Some(to_delete))
+                .send()
+                .await
+                .map_err(|e| {
+                    aws_error(
+                        &format!("BatchDeletePartition {target_database}.{target_name}"),
+                        e,
+                    )
+                })?;
+        }
+
+        for chunk in src_partitions.chunks(100) {
+            let to_create = chunk
+                .iter()
+                .map(|p| {
+                    PartitionInput::builder()
+                        .set_values(Some(p.values().to_vec()))
+                        .set_storage_descriptor(p.storage_descriptor().cloned())
+                        .set_parameters(p.parameters().cloned())
+                        .build()
+                })
+                .collect::<Vec<_>>();
+            glue.batch_create_partition()
+                .database_name(&target_database)
+                .table_name(&target_name)
+                .set_partition_input_list(Some(to_create))
+                .send()
+                .await
+                .map_err(|e| {
+                    aws_error(
+                        &format!("BatchCreatePartition {target_database}.{target_name}"),
+                        e,
+                    )
+                })?;
+        }
+
+        Ok(())
+    })
+}
+
+/// Every partition of a table. A table that does not exist yields none, which is
+/// what a swap onto a not-yet-existing target wants.
+async fn all_partitions(
+    glue: &aws_sdk_glue::Client,
+    database: &str,
+    table: &str,
+) -> AdapterResult<Vec<aws_sdk_glue::types::Partition>> {
+    let mut out = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut req = glue
+            .get_partitions()
+            .database_name(database)
+            .table_name(table)
+            .max_results(100);
+        if let Some(t) = &token {
+            req = req.next_token(t);
+        }
+        let page = match req.send().await {
+            Ok(p) => p,
+            Err(e) if is_entity_not_found(&e) => break,
+            Err(e) => return Err(aws_error(&format!("GetPartitions {database}.{table}"), e)),
+        };
+        out.extend(page.partitions().iter().cloned());
+        token = page.next_token().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub struct GlueCatalogRow {
     pub table_schema: String,
     pub table_name: String,
