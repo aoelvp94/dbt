@@ -73,6 +73,7 @@ impl_entity_not_found!(
     aws_sdk_glue::operation::get_table::GetTableError,
     aws_sdk_glue::operation::get_tables::GetTablesError,
     aws_sdk_glue::operation::get_table_versions::GetTableVersionsError,
+    aws_sdk_glue::operation::get_partitions::GetPartitionsError,
 );
 
 fn aws_error(op: &str, e: impl std::error::Error) -> AdapterError {
@@ -410,6 +411,60 @@ pub fn glue_list_tables(
                 Err(e) => return Err(aws_error(&format!("GetTables {database}"), e)),
             };
             out.extend(page.table_list().iter().map(glue_table_info));
+            token = page.next_token().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// The S3 locations of the partitions matching a Glue partition expression.
+///
+/// dbt-athena's `clean_up_partitions`: `GetPartitions` with the expression, then
+/// the caller deletes each partition's data. A table or database that does not
+/// exist yields no locations, so a first run cleans up nothing rather than failing.
+pub fn glue_partition_locations(
+    clients: &Arc<AthenaAwsClients>,
+    database: &str,
+    table: &str,
+    expression: &str,
+) -> AdapterResult<Vec<String>> {
+    let glue = clients.glue.clone();
+    let database = database.to_lowercase();
+    let table = table.to_lowercase();
+    let expression = expression.to_string();
+    block_on(async move {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = glue
+                .get_partitions()
+                .database_name(&database)
+                .table_name(&table)
+                .expression(&expression)
+                .max_results(100);
+            if let Some(t) = &token {
+                req = req.next_token(t);
+            }
+            let page = match req.send().await {
+                Ok(p) => p,
+                Err(e) if is_entity_not_found(&e) => break,
+                Err(e) => {
+                    return Err(aws_error(
+                        &format!("GetPartitions {database}.{table} where {expression}"),
+                        e,
+                    ));
+                }
+            };
+            out.extend(
+                page.partitions()
+                    .iter()
+                    .filter_map(|p| p.storage_descriptor())
+                    .filter_map(|sd| sd.location())
+                    .map(str::to_string),
+            );
             token = page.next_token().map(str::to_string);
             if token.is_none() {
                 break;

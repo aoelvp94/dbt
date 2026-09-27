@@ -535,6 +535,55 @@ impl Adapter {
     /// `s3tablescatalog/<bucket>`. The Glue and Lake Formation APIs do not serve
     /// it, so the macros use this to skip Glue-only housekeeping (table-version
     /// expiry, the rename-based swap) and to drop through SQL instead.
+    /// dbt-athena `clean_up_partitions`: delete the S3 data of the partitions an
+    /// `insert_overwrite` run is about to replace.
+    ///
+    /// The macro passes one Glue partition expression per partition present in the
+    /// staging table (`day='2026-09-24'`). For each, the matching partitions are
+    /// looked up in Glue and their locations deleted from S3. Glue keeps the
+    /// partition metadata; the subsequent INSERT writes new files under the same
+    /// location, which is what makes the strategy idempotent per partition.
+    ///
+    /// A table that does not exist yet yields no partitions, so a first run is a
+    /// no-op rather than a failure.
+    pub fn athena_clean_up_partitions(
+        &self,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("clean_up_partitions")?;
+        let iter = ArgsIter::new("clean_up_partitions", &["relation", "partitions"], args);
+        let relation = iter.next_arg::<&Value>()?;
+        let relation = downcast_value_to_dyn_base_relation(relation)?;
+        let partitions = iter.next_arg::<&Value>()?;
+        iter.finish()?;
+
+        let schema = relation.schema_as_resolved_str()?;
+        let identifier = relation.identifier_as_resolved_str()?;
+        let clients = aws::clients(self.engine().get_config())?;
+
+        let expressions = partitions
+            .try_iter()
+            .map_err(|e| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("clean_up_partitions expects a list of partitions: {e}"),
+                )
+            })?
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+
+        for expression in expressions {
+            let locations =
+                aws::glue_partition_locations(&clients, &schema, &identifier, &expression)?;
+            for location in locations {
+                let (bucket, prefix) = aws::parse_s3_path(&location)?;
+                aws::delete_prefix(&clients, &bucket, &prefix)?;
+            }
+        }
+
+        Ok(Value::from(()))
+    }
+
     pub fn athena_is_s3_tables_database(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
         self.ensure_athena("is_s3_tables_database")?;
         let iter = ArgsIter::new("is_s3_tables_database", &["database"], args);
@@ -5157,9 +5206,8 @@ impl Adapter {
             "upload_seed_to_s3" => self.athena_upload_seed_to_s3(state, args),
             "clean_up_table" => self.athena_clean_up_table(state, args),
             "delete_from_glue_catalog" => self.athena_delete_from_glue_catalog(state, args),
-            "clean_up_partitions" | "swap_table" | "drop_glue_database" => {
-                self.athena_glue_unsupported(name)
-            }
+            "clean_up_partitions" => self.athena_clean_up_partitions(args),
+            "swap_table" | "drop_glue_database" => self.athena_glue_unsupported(name),
             // dbt-athena Python-side helpers that need no AWS API.
             "generate_s3_location" => self.athena_generate_s3_location(state, args),
             // dbt-athena builds the docs catalog from Glue, not information_schema.
