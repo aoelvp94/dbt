@@ -529,6 +529,23 @@ impl Adapter {
     /// dbt-athena `get_glue_table_type`: `iceberg_table`, `table` or `view`
     /// for an existing relation, `None` if it does not exist. Returned as
     /// `{"value": ...}` so the macros' `.value` access works.
+    /// True when a database belongs to S3 Tables rather than the Glue Data Catalog.
+    ///
+    /// S3 Tables is reached through a federated catalog named
+    /// `s3tablescatalog/<bucket>`. The Glue and Lake Formation APIs do not serve
+    /// it, so the macros use this to skip Glue-only housekeeping (table-version
+    /// expiry, the rename-based swap) and to drop through SQL instead.
+    pub fn athena_is_s3_tables_database(&self, args: &[Value]) -> Result<Value, minijinja::Error> {
+        self.ensure_athena("is_s3_tables_database")?;
+        let iter = ArgsIter::new("is_s3_tables_database", &["database"], args);
+        let database = iter.next_arg::<&Value>()?;
+        iter.finish()?;
+        let is_s3_tables = database
+            .as_str()
+            .is_some_and(|d| d.to_ascii_lowercase().starts_with("s3tablescatalog"));
+        Ok(Value::from(is_s3_tables))
+    }
+
     pub fn athena_get_glue_table_type(
         &self,
         state: &State,
@@ -5153,6 +5170,7 @@ impl Adapter {
             "run_query_with_partitions_limit_catching" => {
                 self.athena_run_query_with_partitions_limit_catching(state, args)
             }
+            "is_s3_tables_database" => self.athena_is_s3_tables_database(args),
             "get_glue_table_type" => self.athena_get_glue_table_type(state, args),
             "get_glue_table_columns" => self.athena_get_glue_table_columns(args),
             "format_partition_keys" => self.athena_format_partition_keys(args),

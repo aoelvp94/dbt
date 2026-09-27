@@ -190,6 +190,21 @@
     {%- set dest_columns = adapter.get_columns_in_relation(tmp_relation) -%}
     {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
 
+    {#- The loop below creates the target relation in its first iteration, so with
+        no batches it would never be created at all and every statement that reads
+        it afterwards fails with TABLE_NOT_FOUND. An incremental run whose window
+        selects no rows is ordinary, so create the relation empty here, which is
+        what the non-batched CTAS does for an empty result. -#}
+    {%- if partitions_batches | length == 0 -%}
+        {%- do log('NO PARTITIONS TO PROCESS: creating ' ~ relation ~ ' empty') -%}
+        {%- set create_empty_relation_sql -%}
+            select {{ dest_cols_csv }}
+            from {{ tmp_relation }}
+            where 1 = 0
+        {%- endset -%}
+        {%- do run_query(create_table_as(temporary, relation, create_empty_relation_sql, language)) -%}
+    {%- endif -%}
+
     {%- for batch in partitions_batches -%}
         {%- do log('BATCH PROCESSING: ' ~ loop.index ~ ' OF ' ~ partitions_batches | length) -%}
 
@@ -225,7 +240,7 @@
         {{ return(create_table_as(temporary, relation, compiled_code, language)) }}
     {%- elif force_batch -%}
       {%- do create_table_as_with_partitions(temporary, relation, compiled_code, language) -%}
-      {%- set query_result = relation ~ ' with many partitions created' -%}
+      {%- set compiled_code_result = relation ~ ' with many partitions created' -%}
     {%- else -%}
         {%- if temporary -%}
           {%- do run_query(create_table_as(temporary, relation, compiled_code, language, true)) -%}
