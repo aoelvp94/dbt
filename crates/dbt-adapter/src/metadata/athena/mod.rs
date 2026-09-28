@@ -327,11 +327,23 @@ impl MetadataAdapter for AthenaMetadataAdapter {
     }
 }
 
-/// Athena's Glue-backed catalog. The Glue API serves only this one: a relation
-/// in a federated connector or in S3 Tables (`s3tablescatalog/<bucket>`) has to
-/// be read through that catalog's own `information_schema`.
+/// Athena's default Glue catalog.
 const GLUE_CATALOG: &str = "awsdatacatalog";
 
+/// Whether this adapter can read a catalog's metadata from the Glue API.
+///
+/// Glue serves more than the default catalog: S3 Tables is a Glue catalog too,
+/// addressed as `CatalogId = <account>:s3tablescatalog/<bucket>`, and so are the
+/// catalogs registered in Athena, which dbt-athena resolves in `_get_data_catalog`.
+/// Addressing either needs the account id, and that needs an STS or Athena call
+/// this adapter has no client for — so only the default catalog takes the Glue
+/// path here and every other catalog falls back to its own `information_schema`.
+/// That is correct, only one billed query per lookup instead of a free API call.
+///
+/// dbt-labs/dbt#16376 resolves the `CatalogId` through the ADBC driver and reads
+/// Glue for every Glue catalog, which is the split to adopt once it lands; doing
+/// it here would mean another AWS SDK in the engine for a transport that is
+/// already being replaced.
 fn catalog_is_glue(catalog: &str) -> bool {
     catalog.is_empty() || catalog.eq_ignore_ascii_case(GLUE_CATALOG)
 }
@@ -365,11 +377,11 @@ fn list_relations_sql(catalog: &str, schema: &str) -> String {
 /// List every table and view in a schema.
 ///
 /// Glue `GetTables` first: milliseconds and free, where an `information_schema`
-/// query takes seconds and bills Athena's 10 MB minimum. Glue serves only the
-/// Data Catalog, so a relation in any other catalog falls back to that
-/// catalog's own `information_schema` — as does a Glue call that fails for any
-/// reason, since Lake Formation can deny `GetTables` on tables that stay
-/// perfectly queryable through Athena.
+/// query takes seconds and bills Athena's 10 MB minimum. Only the default
+/// catalog is addressed here (see `catalog_is_glue`), so a relation in any other
+/// catalog falls back to that catalog's own `information_schema` — as does a Glue
+/// call that fails for any reason, since Lake Formation can deny `GetTables` on
+/// tables that stay perfectly queryable through Athena.
 ///
 /// A schema that does not exist yields zero rows rather than an error, which is
 /// what cache hydration wants for not-yet-created target schemas.
@@ -458,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn glue_serves_only_the_data_catalog() {
+    fn only_the_default_catalog_takes_the_glue_path() {
         assert!(catalog_is_glue(""));
         assert!(catalog_is_glue("awsdatacatalog"));
         assert!(catalog_is_glue("AwsDataCatalog"));

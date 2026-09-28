@@ -3,9 +3,10 @@
     delegating back to adapter.get_columns_in_relation would recurse.
 
     Glue first: get_glue_table_columns is one free API call, where the
-    information_schema query bills Athena's 10 MB minimum per relation. Glue
-    serves only the Data Catalog, so a relation in another catalog (S3 Tables:
-    s3tablescatalog/<bucket>) reads that catalog's own information_schema —
+    information_schema query bills Athena's 10 MB minimum per relation. Only the
+    default catalog is addressed through Glue here -- S3 Tables and the catalogs
+    registered in Athena are Glue catalogs too, but addressing them needs the
+    account id in a CatalogId, so they read their own information_schema instead.
     Trino's has no length/precision/scale, hence the null casts. -#}
 {% macro athena__get_columns_in_relation(relation) -%}
   {%- set catalog = relation.database -%}
