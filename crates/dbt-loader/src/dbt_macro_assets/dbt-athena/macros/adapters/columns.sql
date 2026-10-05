@@ -9,8 +9,11 @@
     account id in a CatalogId, so they read their own information_schema instead.
     Trino's has no length/precision/scale, hence the null casts. -#}
 {% macro athena__get_columns_in_relation(relation) -%}
-  {%- set catalog = relation.database -%}
-  {%- if catalog is none or catalog | lower == 'awsdatacatalog' -%}
+  {#- The catalog arrives bare or already quoted depending on the call path; a
+      quoted name left alone both fails the test below and renders as
+      """catalog""" in the query. -#}
+  {%- set catalog = none if relation.database is none else relation.database | replace('"', '') -%}
+  {%- if catalog is none or catalog == '' or catalog | lower == 'awsdatacatalog' -%}
     {{ return(sql_convert_columns_in_relation(adapter.get_glue_table_columns(relation))) }}
   {%- endif -%}
   {% call statement('get_columns_in_relation', fetch_result=True) %}

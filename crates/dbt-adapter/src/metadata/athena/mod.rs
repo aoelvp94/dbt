@@ -344,7 +344,19 @@ const GLUE_CATALOG: &str = "awsdatacatalog";
 /// Glue for every Glue catalog, which is the split to adopt once it lands; doing
 /// it here would mean another AWS SDK in the engine for a transport that is
 /// already being replaced.
+/// A catalog name reaches the adapter bare or already quoted, depending on the
+/// call path, so both comparison and rendering use the bare form.
+///
+/// Getting this wrong is quiet rather than loud: a quoted name fails the Glue
+/// test, every lookup falls back to `information_schema`, and the saving is
+/// given back with no error anywhere. Rendering is worse — a quoted name
+/// re-quoted produces `"""catalog"""`, which is a syntax error.
+fn unquote_catalog(catalog: &str) -> &str {
+    catalog.trim_matches('"')
+}
+
 fn catalog_is_glue(catalog: &str) -> bool {
+    let catalog = unquote_catalog(catalog);
     catalog.is_empty() || catalog.eq_ignore_ascii_case(GLUE_CATALOG)
 }
 
@@ -353,6 +365,7 @@ fn catalog_is_glue(catalog: &str) -> bool {
 /// Athena's `information_schema` covers only the catalog it is read from, so
 /// the catalog belongs in the table reference, not only in a filter.
 fn list_relations_sql(catalog: &str, schema: &str) -> String {
+    let catalog = unquote_catalog(catalog);
     let schema_literal = athena_string_literal(schema);
     let catalog_filter = if catalog.is_empty() {
         String::new()
@@ -475,6 +488,16 @@ mod tests {
         assert!(catalog_is_glue("awsdatacatalog"));
         assert!(catalog_is_glue("AwsDataCatalog"));
         assert!(!catalog_is_glue("s3tablescatalog/lab-bucket"));
+    }
+
+    #[test]
+    fn a_quoted_catalog_name_is_still_recognised() {
+        assert!(catalog_is_glue("\"awsdatacatalog\""));
+        assert!(!catalog_is_glue("\"s3tablescatalog/lab-bucket\""));
+        assert_eq!(
+            list_relations_sql("\"s3tablescatalog/lab-bucket\"", "analytics"),
+            list_relations_sql("s3tablescatalog/lab-bucket", "analytics")
+        );
     }
 
     #[test]
