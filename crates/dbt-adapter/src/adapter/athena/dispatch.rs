@@ -20,6 +20,8 @@ use crate::cast_util::downcast_value_to_dyn_base_relation;
 use crate::errors::{AdapterError, AdapterErrorKind};
 use crate::value::none_value;
 use dbt_agate::AgateTable;
+use serde_json::Value as Json;
+use std::sync::Arc;
 use dbt_auth::AdapterConfig;
 use minijinja::arg_utils::ArgsIter;
 use minijinja::value::ValueKind;
@@ -390,6 +392,186 @@ impl Adapter {
         };
         let deleted = aws.expire_glue_table_versions(&relation, to_keep, delete_s3)?;
         Ok(Value::from(deleted))
+    }
+
+
+    /// `adapter.get_catalog(information_schema, schemas)` and
+    /// `adapter.get_catalog_by_relations(information_schema, relations)`.
+    ///
+    /// dbt-athena builds the docs catalog from Glue rather than from
+    /// `information_schema`, and so does this: `glue.get_tables` per schema,
+    /// flattened to the one-row-per-column shape Fusion expects. Besides saving
+    /// the query, a schema-wide `information_schema` read fails outright when a
+    /// single table in the schema has unreadable Iceberg metadata; Glue never
+    /// touches table data.
+    ///
+    /// Regular columns come first and partition keys after, which is the order
+    /// Athena's `information_schema.columns` reports.
+    pub fn athena_get_catalog(
+        &self,
+        state: &State,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, JinjaError> {
+        let second = if name == "get_catalog" { "schemas" } else { "relations" };
+        let arg_names = ["information_schema", second];
+        let iter = ArgsIter::new(name, &arg_names, args);
+        let information_schema = iter.next_arg::<&Value>()?;
+        let items = iter.next_arg::<&Value>()?;
+        iter.finish()?;
+
+        let database = information_schema
+            .get_attr("database")
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.trim_matches('"').to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "awsdatacatalog".to_string());
+
+        // schema -> Some(only these tables) | None (the whole schema)
+        let mut wanted: std::collections::BTreeMap<String, Option<Vec<String>>> =
+            std::collections::BTreeMap::new();
+        for item in items.try_iter()? {
+            let (schema, identifier) = if name == "get_catalog" {
+                (item.as_str().map(str::to_string), None)
+            } else {
+                let parts = relation_parts(&item).ok();
+                (
+                    parts.as_ref().map(|p| p.schema.clone()),
+                    parts.map(|p| p.identifier).filter(|s| !s.is_empty()),
+                )
+            };
+            let Some(schema) = schema.filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let entry = wanted
+                .entry(schema.to_lowercase())
+                .or_insert_with(|| Some(Vec::new()));
+            match (identifier, entry.as_mut()) {
+                (Some(id), Some(list)) => list.push(id),
+                (None, _) => *entry = None,
+                (Some(_), None) => {}
+            }
+        }
+
+        let Some(aws) = self.athena_ops(state) else {
+            return Ok(none_value());
+        };
+
+        struct Row {
+            schema: String,
+            table: String,
+            table_type: String,
+            table_comment: Option<String>,
+            table_owner: Option<String>,
+            column: String,
+            index: i64,
+            column_type: String,
+            column_comment: Option<String>,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+
+        for (schema, tables) in &wanted {
+            let only: Option<std::collections::HashSet<String>> = tables
+                .as_ref()
+                .map(|ts| ts.iter().map(|t| t.to_lowercase()).collect());
+            let Some(listed_tables) = aws.glue_tables(&database, schema)? else {
+                continue;
+            };
+            for table in listed_tables {
+                let Some(table_name) = table.get("Name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if let Some(only) = &only
+                    && !only.contains(&table_name.to_lowercase())
+                {
+                    continue;
+                }
+                let table_type = match table.get("TableType").and_then(|v| v.as_str()) {
+                    Some("VIRTUAL_VIEW") => "VIEW",
+                    _ => "BASE TABLE",
+                }
+                .to_string();
+                let str_of = |v: Option<&Json>| {
+                    v.and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty())
+                };
+                let table_comment = str_of(table.get("Description"));
+                let table_owner = str_of(table.get("Owner"));
+
+                let regular = table
+                    .get("StorageDescriptor")
+                    .and_then(|sd| sd.get("Columns"))
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let partitions = table
+                    .get("PartitionKeys")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let mut index = 0i64;
+                for column in regular.iter().chain(partitions.iter()) {
+                    let Some(column_name) = column.get("Name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    index += 1;
+                    rows.push(Row {
+                        schema: schema.clone(),
+                        table: table_name.to_string(),
+                        table_type: table_type.clone(),
+                        table_comment: table_comment.clone(),
+                        table_owner: table_owner.clone(),
+                        column: column_name.to_string(),
+                        index,
+                        column_type: column
+                            .get("Type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        column_comment: str_of(column.get("Comment")),
+                    });
+                }
+            }
+        }
+
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let strs = |f: &dyn Fn(&Row) -> Option<String>| -> ArrayRef {
+            Arc::new(StringArray::from(
+                rows.iter().map(f).collect::<Vec<Option<String>>>(),
+            ))
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![database.as_str(); rows.len()])),
+            strs(&|r| Some(r.schema.clone())),
+            strs(&|r| Some(r.table.clone())),
+            strs(&|r| Some(r.table_type.clone())),
+            strs(&|r| r.table_comment.clone()),
+            strs(&|r| Some(r.column.clone())),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.index).collect::<Vec<i64>>(),
+            )),
+            strs(&|r| Some(r.column_type.clone())),
+            strs(&|r| r.column_comment.clone()),
+            strs(&|r| r.table_owner.clone()),
+        ];
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("table_database", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("table_type", DataType::Utf8, false),
+            Field::new("table_comment", DataType::Utf8, true),
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("column_index", DataType::Int64, false),
+            Field::new("column_type", DataType::Utf8, false),
+            Field::new("column_comment", DataType::Utf8, true),
+            Field::new("table_owner", DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(arrow_schema, columns)
+            .map_err(|e| invalid(&format!("{name}: failed to build the catalog batch: {e}")))?;
+        Ok(Value::from_object(AgateTable::from_record_batch(Arc::new(
+            batch,
+        ))))
     }
 
     /// `adapter.swap_table(src_relation, target_relation)`

@@ -82,7 +82,7 @@ impl AthenaOps<'_, '_, '_> {
     }
 
     /// The Glue tables of a schema; empty when the schema does not exist.
-    fn glue_tables(&self, database: &str, schema: &str) -> AdapterResult<Option<Vec<Json>>> {
+    pub(super) fn glue_tables(&self, database: &str, schema: &str) -> AdapterResult<Option<Vec<Json>>> {
         let Some(mut payload) = self.glue_scope(database)? else {
             return Ok(None);
         };

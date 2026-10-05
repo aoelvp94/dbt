@@ -53,6 +53,8 @@ impl SemanticCategory {
             | "valid_snapshot_target"
             // Athena
             | "get_glue_table_type"
+            | "get_catalog"
+            | "get_catalog_by_relations"
             | "is_work_group_output_location_enforced"
             | "describe_relation"
             | "get_column_schema_from_query"

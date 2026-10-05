@@ -4464,6 +4464,9 @@ impl Adapter {
             "delete_from_glue_catalog" => self.athena_delete_from_glue_catalog(state, args),
             "drop_glue_database" => self.athena_drop_glue_database(state, args),
             "expire_glue_table_versions" => self.athena_expire_glue_table_versions(state, args),
+            "get_catalog" | "get_catalog_by_relations" => {
+                self.athena_get_catalog(state, name, args)
+            }
             "swap_table" => self.athena_swap_table(state, args),
             "clean_up_partitions" => self.athena_clean_up_partitions(state, args),
             "delete_from_s3" => self.athena_delete_from_s3(state, args),
