@@ -32,7 +32,9 @@ pub fn duckdb_attaches_via(catalog_type: CatalogType) -> Option<DuckDbAttachKind
         | CatalogType::SnowflakeNative
         | CatalogType::BigqueryNative
         | CatalogType::DuckdbNative
-        | CatalogType::SparkNative => None,
+        | CatalogType::SparkNative
+        // Athena only: `s3_tables` catalogs take no `duckdb` block.
+        | CatalogType::S3Tables => None,
     }
 }
 

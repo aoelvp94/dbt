@@ -88,9 +88,25 @@ pub fn get_relation(
             adapter, state, ctx, conn, database, schema, identifier, token,
         ),
         AdapterType::Starburst => todo!("Starburst"),
-        AdapterType::Athena => athena_get_relation(
-            adapter, state, ctx, conn, database, schema, identifier, token,
-        ),
+        // Glue catalogs are read through the driver's Glue API (part 6).
+        // Every other catalog, including S3 Tables, is read from
+        // information_schema (part 5), which that API does not cover.
+        AdapterType::Athena => {
+            match adapter.athena_get_relation(
+                state,
+                ctx,
+                conn,
+                database,
+                schema,
+                identifier,
+                token.clone(),
+            )? {
+                Some(relation) => Ok(relation),
+                None => athena_get_relation(
+                    adapter, state, ctx, conn, database, schema, identifier, token,
+                ),
+            }
+        }
         AdapterType::Trino => todo!("Trino"),
         AdapterType::Dremio => todo!("Dremio"),
         AdapterType::Oracle => todo!("Oracle"),
